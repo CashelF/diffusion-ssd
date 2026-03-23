@@ -1,12 +1,18 @@
 import os
 import ssd.paths  # noqa: F401 — sets TORCH_CUDA_ARCH_LIST before flashinfer import
 
+import dataclasses
 from ssd.config import Config
 from ssd.sampling_params import SamplingParams
 from ssd.utils.misc import infer_model_family
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.model_runner import ModelRunner
+from ssd.engine.draft_backends import (
+    AutoregressiveDraftBackend,
+    BlockDiffusionDraftBackend,
+    SwitchingDraftBackend,
+)
 from ssd.engine.draft_runner import DraftRunner
 from ssd.engine.speculator_async import SpeculatorAsync
 from ssd.engine.speculator_sync import SpeculatorSync
@@ -49,14 +55,29 @@ class LLMEngine:
             2 * config.speculate_k + 2), "ERROR: support for block size < 2*k+2 is not implemented"
         assert config.num_gpus > 1 or not config.draft_async, "ERROR: draft_async requires at least 2 gpus"
             
-        # Check that target and draft are from the same family
-        if config.speculate:
+        # Autoregressive drafting reuses the repo's custom kernels and therefore
+        # requires a matching model family. Block drafting only requires the same
+        # target vocabulary because verification remains exact.
+        if config.speculate and config.draft_backend == "ar":
             target_family = infer_model_family(config.model)
             draft_family = infer_model_family(config.draft)
             assert target_family == draft_family, f"ERROR: target model family and draft model family must match"
+        elif config.speculate and config.draft_backend == "block":
+            assert config.draft_hf_config is not None
+            assert config.draft_hf_config.vocab_size == config.hf_config.vocab_size, (
+                "ERROR: block draft model and target model must share vocab size"
+            )
+            if config.block_warm_start_mode == "ar":
+                target_family = infer_model_family(config.model)
+                warm_family = infer_model_family(config.block_warm_start_draft)
+                assert target_family == warm_family, (
+                    "ERROR: target model family and block warm-start draft model "
+                    "family must match"
+                )
 
         self.ps = []
         self.events = []
+        self.sync_draft_backend = None
 
         ctx = mp.get_context("spawn")
         self.num_tp_gpus = config.num_gpus if not self.config.draft_async else config.num_gpus - 1
@@ -108,10 +129,64 @@ class LLMEngine:
             self.prev_blocks_per_fork = None
 
         if config.speculate and not config.draft_async:
-            # keep it colocated on rank 0, process/dist agnostic in this case
-            self.draft_runner = DraftRunner(config)
-            self.draft_cfg = self.draft_runner.draft_cfg
-            print(f'Draft runner created on rank 0 (no async)', flush=True)
+            if config.draft_backend == "ar":
+                # keep it colocated on rank 0, process/dist agnostic in this case
+                self.draft_runner = DraftRunner(config)
+                self.draft_cfg = self.draft_runner.draft_cfg
+                self.sync_draft_backend = AutoregressiveDraftBackend(self.draft_runner)
+                print(f'Draft runner created on rank 0 (no async)', flush=True)
+            else:
+                self.draft_runner = None
+
+                def make_block_backend():
+                    return BlockDiffusionDraftBackend(config)
+
+                if config.block_warm_start_mode == "ar":
+                    warm_cfg = dataclasses.replace(
+                        config,
+                        draft=config.block_warm_start_draft,
+                        draft_backend="ar",
+                        draft_hf_config=config.block_warm_start_draft_hf_config,
+                    )
+                    initial_warm_runner = DraftRunner(warm_cfg)
+                    initial_warm_backend = AutoregressiveDraftBackend(
+                        initial_warm_runner
+                    )
+                    self.draft_cfg = initial_warm_runner.draft_cfg
+
+                    def make_warm_backend():
+                        warm_runner = DraftRunner(warm_cfg)
+                        return AutoregressiveDraftBackend(warm_runner)
+
+                    self.sync_draft_backend = SwitchingDraftBackend(
+                        primary_factory=make_block_backend,
+                        primary_name="block",
+                        warm_factory=make_warm_backend,
+                        warm_name="ar_warm_start",
+                        warm_start_tokens=config.block_warm_start_tokens,
+                        keep_loaded=config.block_warm_start_keep_loaded,
+                        verbose=config.verbose,
+                        initial_warm_backend=initial_warm_backend,
+                    )
+                    print(
+                        "Block draft backend enabled with AR warm start "
+                        f"({config.block_warm_start_tokens} tokens)",
+                        flush=True,
+                    )
+                else:
+                    self.draft_cfg = dataclasses.replace(
+                        config,
+                        model=config.draft,
+                    )
+                    # The block draft backend does not maintain its own KV cache,
+                    # but the scheduler still needs a draft-side block manager for
+                    # speculative lookahead accounting.
+                    self.draft_cfg.num_kvcache_blocks = config.num_kvcache_blocks
+                    self.sync_draft_backend = BlockDiffusionDraftBackend(config)
+                    print(
+                        'Block draft backend enabled (sync speculative decode, no draft KV runner)',
+                        flush=True,
+                    )
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -158,6 +233,11 @@ class LLMEngine:
                 if self.draft_ps.is_alive():
                     self.draft_ps.terminate()
                     self.draft_ps.join(timeout=2)
+        except Exception:
+            pass
+        try:
+            if self.sync_draft_backend is not None:
+                self.sync_draft_backend.close()
         except Exception:
             pass
         # 5) Kill resource tracker so it doesn't print spurious warnings,
@@ -290,7 +370,7 @@ class LLMEngine:
                 speculator = SpeculatorSync(
                     lookahead=config.speculate_k,
                     device=config.device,
-                    draft_model_runner=self.draft_runner,
+                    draft_backend=self.sync_draft_backend,
                 )
 
             verifier = Verifier(
@@ -327,6 +407,9 @@ class LLMEngine:
     ) -> list[str]:
         for k in METRICS:
             METRICS[k] = [] if isinstance(METRICS[k], list) else 0
+
+        if self.sync_draft_backend is not None:
+            self.sync_draft_backend.reset()
 
         if use_tqdm:
             pbar = tqdm(total=len(prompts),

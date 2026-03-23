@@ -60,6 +60,46 @@ python -O bench.py --llama --size 70 --async --spec --k 7 --f 3 --b 1 \
     --temp 0 --numseqs 128 --output_len 512 --all --gpus 5
 ```
 
+Block-diffusion speculative drafting is also exposed through `bench.py`.
+Useful knobs include:
+```bash
+python -O bench.py --qwen --size 1.7 --spec --draft-backend block \
+    --draft /path/to/block-diffusion-model \
+    --k 15 --block-refine-steps 2 --block-sampler remask \
+    --block-special-tokens interior \
+    --block-warm-start-mode ar \
+    --block-warm-start-tokens 96 \
+    --block-warm-start-draft /path/to/ar-draft-model
+```
+
+For a BD3LM-style staircase sampler with cached prefix reuse, use:
+```bash
+python -O bench.py --qwen --size 1.7 --spec --draft-backend block \
+    --draft /path/to/block-diffusion-model \
+    --k 15 --block-refine-steps 4 \
+    --block-sampler first_hitting \
+    --block-attention staircase \
+    --block-prefix-cache \
+    --block-draft-block-size 32 \
+    --block-special-tokens interior
+```
+
+For one-off AR-vs-block comparisons on a single GPU, use:
+```bash
+python bench/compare_speculative_drafts.py --verbose-engine
+```
+
+The compare helper also accepts the new block options, for example:
+```bash
+python bench/compare_speculative_drafts.py \
+    --mode block \
+    --block-sampler first_hitting \
+    --block-attention staircase \
+    --block-prefix-cache \
+    --block-draft-block-size 32 \
+    --verbose-engine
+```
+
 ### SGLang
 ```bash
 conda activate sglang

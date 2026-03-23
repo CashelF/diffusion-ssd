@@ -23,6 +23,34 @@ def parse_arguments():
     parser.add_argument("--qwen", action="store_true", help="Use Qwen models instead of Llama")
     parser.add_argument("--draft", type=str, default=None,
                         help="Draft model size (0.6 for Qwen-0.6B, 1 for Llama-1B) or path to draft model")
+    parser.add_argument("--draft-backend", type=str, choices=["ar", "block"], default="ar",
+                        help="Draft backend type: autoregressive ('ar') or block-parallel masked/diffusion-style ('block')")
+    parser.add_argument("--block-refine-steps", type=int, default=4,
+                        help="Number of parallel refinement steps for --draft-backend block")
+    parser.add_argument("--block-sampler", type=str, choices=["mask_predict", "remask", "first_hitting"], default="mask_predict",
+                        help="Sampling/update rule for --draft-backend block")
+    parser.add_argument("--block-attention", type=str, choices=["full", "staircase"], default="full",
+                        help="Attention structure for --draft-backend block")
+    parser.add_argument("--block-prefix-cache", action="store_true",
+                        help="Reuse cached prefix KV state for block drafting (requires --block-attention staircase)")
+    parser.add_argument("--block-draft-block-size", type=int, default=None,
+                        help="Block size used by staircase/block-diffusion attention (defaults to speculative k)")
+    parser.add_argument("--block-mask-token-id", type=int, default=None,
+                        help="Override tokenizer mask token id for --draft-backend block")
+    parser.add_argument("--block-special-tokens", type=str, choices=["none", "interior", "all"], default="none",
+                        help="Whether to ban special tokens during block drafting")
+    parser.add_argument("--block-forbid-token-ids", type=int, nargs='+', default=None,
+                        help="Extra token ids to forbid during block drafting")
+    parser.add_argument("--block-no-reuse-step-buffers", action="store_true",
+                        help="Disable reusable GPU step buffers for block drafting")
+    parser.add_argument("--block-warm-start-mode", type=str, choices=["none", "ar"], default="none",
+                        help="Warm-start mode before switching to block drafting")
+    parser.add_argument("--block-warm-start-tokens", type=int, default=0,
+                        help="Use the warm-start backend for the first N completion tokens before switching to block drafting")
+    parser.add_argument("--block-warm-start-draft", type=str, default=None,
+                        help="Draft model/path to use for AR warm-start before block drafting")
+    parser.add_argument("--block-warm-start-keep-loaded", action="store_true",
+                        help="Keep both the warm-start drafter and block drafter loaded at once (better for multi-GPU servers, riskier on 1 GPU)")
 
     # Execution configuration
     parser.add_argument("--eager", action="store_true", help="Use eager execution (disable CUDA graphs)")
@@ -85,6 +113,27 @@ def parse_arguments():
         assert args.llama, "Eagle currently only supports llama models"
         assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
+    if args.draft_backend == "block":
+        assert args.spec, "--draft-backend block requires --spec"
+        assert not getattr(args, 'async', False), "--draft-backend block currently supports sync speculation only"
+        assert not args.eagle, "--draft-backend block does not support EAGLE"
+        if args.block_prefix_cache:
+            assert args.block_attention == "staircase", (
+                "--block-prefix-cache requires --block-attention staircase"
+            )
+        if args.block_sampler == "first_hitting":
+            assert args.block_attention == "staircase", (
+                "--block-sampler first_hitting requires --block-attention staircase"
+            )
+        if args.block_warm_start_mode == "ar":
+            assert args.block_warm_start_tokens > 0, (
+                "--block-warm-start-mode ar requires "
+                "--block-warm-start-tokens > 0"
+            )
+            assert args.block_warm_start_draft is not None, (
+                "--block-warm-start-mode ar requires "
+                "--block-warm-start-draft"
+            )
     return args
 
 
@@ -109,10 +158,28 @@ def create_run_name(args):
         temp_str += f"_dtemp{args.dtemp}"
 
     draft_str = f"_draft{args.draft}" if args.draft is not None else "_nodraft"
+    draft_backend_str = "" if args.draft_backend == "ar" else f"_draftbackend{args.draft_backend}"
+    block_cfg_str = ""
+    if args.draft_backend == "block":
+        block_cfg_str = (
+            f"_bsampler{args.block_sampler}"
+            f"_battn{args.block_attention}"
+            f"_bsteps{args.block_refine_steps}"
+            f"_bspecial{args.block_special_tokens}"
+        )
+        if args.block_prefix_cache:
+            block_cfg_str += "_bpcache"
+        if args.block_draft_block_size is not None:
+            block_cfg_str += f"_bdraftblk{args.block_draft_block_size}"
+        if args.block_warm_start_mode != "none":
+            block_cfg_str += (
+                f"_bwarm{args.block_warm_start_mode}"
+                f"{args.block_warm_start_tokens}"
+            )
     k_str = f"_k{args.k}"
     f_str = f"_f{args.f}"
 
-    return args.name if args.name else f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}{temp_str}{sampler_x_str}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}{random_str}{all_str}{gsm_str}"
+    return args.name if args.name else f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}{draft_backend_str}{block_cfg_str}{temp_str}{sampler_x_str}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}{random_str}{all_str}{gsm_str}"
 
 
 def initialize_wandb(args, run_name):
@@ -140,6 +207,18 @@ def initialize_wandb(args, run_name):
             "output_len": args.output_len,
             "numseqs": args.numseqs,
             "draft_model": args.draft,
+            "draft_backend": args.draft_backend,
+            "block_refine_steps": args.block_refine_steps if args.draft_backend == "block" else None,
+            "block_sampler": args.block_sampler if args.draft_backend == "block" else None,
+            "block_attention": args.block_attention if args.draft_backend == "block" else None,
+            "block_prefix_cache": args.block_prefix_cache if args.draft_backend == "block" else None,
+            "block_draft_block_size": args.block_draft_block_size if args.draft_backend == "block" else None,
+            "block_special_tokens": args.block_special_tokens if args.draft_backend == "block" else None,
+            "block_reuse_step_buffers": (not args.block_no_reuse_step_buffers) if args.draft_backend == "block" else None,
+            "block_forbid_token_ids": args.block_forbid_token_ids if args.draft_backend == "block" else None,
+            "block_warm_start_mode": args.block_warm_start_mode if args.draft_backend == "block" else None,
+            "block_warm_start_tokens": args.block_warm_start_tokens if args.draft_backend == "block" else None,
+            "block_warm_start_keep_loaded": args.block_warm_start_keep_loaded if args.draft_backend == "block" else None,
             "b": args.b,
             "block_size": args.block_sz,
             "eager": args.eager,
@@ -168,12 +247,26 @@ def create_llm_kwargs(args, draft_path):
         async_fan_out=args.f,
         verbose=args.verbose,
         draft=draft_path,
+        draft_backend=args.draft_backend,
         kvcache_block_size=args.block_sz,
         max_num_seqs=args.b,
         max_model_len=args.max_model_len,
         sampler_x=args.x,
         jit_speculate=(args.backup == "jit"),
         max_steps=args.max_steps,
+        block_draft_refine_steps=args.block_refine_steps,
+        block_draft_sampler=args.block_sampler,
+        block_draft_attention=args.block_attention,
+        block_draft_use_prefix_cache=args.block_prefix_cache,
+        block_draft_block_size=args.block_draft_block_size,
+        block_draft_mask_token_id=args.block_mask_token_id,
+        block_draft_special_tokens=args.block_special_tokens,
+        block_draft_forbid_token_ids=args.block_forbid_token_ids,
+        block_reuse_step_buffers=not args.block_no_reuse_step_buffers,
+        block_warm_start_mode=args.block_warm_start_mode,
+        block_warm_start_tokens=args.block_warm_start_tokens,
+        block_warm_start_draft=args.block_warm_start_draft,
+        block_warm_start_keep_loaded=args.block_warm_start_keep_loaded,
     )
 
     if args.flh is not None:
@@ -356,7 +449,8 @@ def main():
             async_mode = " + Async" if getattr(args, 'async', False) else ""
             jit_mode = " + JIT" if args.backup == "jit" else ""
             x_mode = f" + X({args.x})" if args.x else ""
-            full_mode = mode + spec_mode + async_mode + jit_mode + x_mode
+            draft_backend_mode = " + BlockDraft" if args.spec and args.draft_backend == "block" else ""
+            full_mode = mode + spec_mode + async_mode + jit_mode + x_mode + draft_backend_mode
 
             print(f"Model: {model_name}, Mode: {full_mode}, Total: {total_tokens}tok, Time: {total_time:.2f}s, Total Throughput: {throughput:.2f}tok/s")
 
