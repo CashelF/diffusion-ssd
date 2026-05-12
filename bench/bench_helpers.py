@@ -6,9 +6,9 @@ from random import randint
 from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
 try:
-    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
-except ImportError:
     from bench_paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
+except ImportError:
+    from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
 
 
 def _get_snapshot_path(base_path: str) -> str:
@@ -46,6 +46,10 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
     """Get draft model path based on size or explicit directory."""
     if args.draft is not None and os.path.isdir(args.draft):
         return args.draft
+    if args.draft is not None and getattr(args, "draft_backend", None) == "dflash":
+        cache_name = f"models--{args.draft.replace('/', '--')}"
+        cached_path = os.path.join(cache_dir, cache_name)
+        return cached_path if os.path.isdir(cached_path) else args.draft
     
     # Handle EAGLE auto-selection
     if getattr(args, "eagle", False):
@@ -135,7 +139,10 @@ def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Opti
     else:
          draft_base = default_draft_base
          
-    draft_path = _get_snapshot_path(draft_base)
+    if getattr(args, "draft_backend", None) == "dflash" and not os.path.isdir(draft_base):
+        draft_path = draft_base
+    else:
+        draft_path = _get_snapshot_path(draft_base)
 
     return model_name, model_path, draft_path
 
@@ -146,6 +153,7 @@ def load_dataset_token_ids(
     num_prompts: int,
     input_len: int,
     use_chat_template: bool = False,
+    enable_thinking: bool | None = None,
 ) -> Optional[List[List[int]]]:
     """Load and tokenize dataset prompts to token ids, padding/truncating to target length.
 
@@ -172,10 +180,21 @@ def load_dataset_token_ids(
                 data = json.loads(line.strip())
                 text: str = data["text"]
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
-                    tokens = tokenizer.apply_chat_template(
-                        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
+                    messages = [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": text},
+                    ]
+                    kwargs = dict(
+                        tokenize=True,
                         add_generation_prompt=True,
                     )
+                    if enable_thinking is not None:
+                        kwargs["enable_thinking"] = enable_thinking
+                    try:
+                        tokens = tokenizer.apply_chat_template(messages, **kwargs)
+                    except TypeError:
+                        kwargs.pop("enable_thinking", None)
+                        tokens = tokenizer.apply_chat_template(messages, **kwargs)
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)
 
@@ -198,6 +217,7 @@ def load_all_dataset_token_ids(
     num_prompts_per_dataset: int,
     input_len: int,
     use_chat_template: bool = False,
+    enable_thinking: bool | None = None,
 ) -> List[List[int]]:
     """Load tokenized prompts from a union of datasets, falling back to random when needed."""
     datasets = ["humaneval", "alpaca", "gsm", "ultrafeedback"]
@@ -208,7 +228,8 @@ def load_all_dataset_token_ids(
             f"Loading {num_prompts_per_dataset} prompts from {dataset_name}...")
         dataset_prompts = load_dataset_token_ids(
             dataset_name, model_path, num_prompts_per_dataset, input_len,
-            use_chat_template=use_chat_template)
+            use_chat_template=use_chat_template,
+            enable_thinking=enable_thinking)
         if dataset_prompts is not None:
             all_prompts.extend(dataset_prompts)
         else:
@@ -233,6 +254,14 @@ def generate_benchmark_inputs(
     - prompt_token_ids: list[list[int]] in dataset/random/all modes
     - original_prompts: for display when --example
     """
+    dflash_mode = getattr(args, "draft_backend", None) == "dflash"
+    use_chat_template = (
+        getattr(args, "chat_template", False)
+        or getattr(args, "eagle", False)
+        or dflash_mode
+    )
+    enable_thinking = False if dflash_mode else None
+
     if getattr(args, "example", False):
         example_prompts = [
             "introduce yourself",
@@ -248,20 +277,37 @@ def generate_benchmark_inputs(
         selected_prompts = example_prompts[:num_prompts]
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        string_prompts = selected_prompts
-        return string_prompts, None, selected_prompts
+        if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+            token_ids = []
+            for prompt in selected_prompts:
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt},
+                ]
+                kwargs = dict(
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+                if enable_thinking is not None:
+                    kwargs["enable_thinking"] = enable_thinking
+                try:
+                    token_ids.append(tokenizer.apply_chat_template(messages, **kwargs))
+                except TypeError:
+                    kwargs.pop("enable_thinking", None)
+                    token_ids.append(tokenizer.apply_chat_template(messages, **kwargs))
+            return None, token_ids, selected_prompts
+        return selected_prompts, None, selected_prompts
 
     if getattr(args, "random", False):
         prompt_token_ids = [[randint(0, 10000) for _ in range(
             args.input_len)] for _ in range(args.numseqs)]
         return None, prompt_token_ids, None
 
-    use_chat_template = getattr(args, "chat_template", False) or getattr(args, "eagle", False)
-
     if getattr(args, "all", False):
         token_ids = load_all_dataset_token_ids(
             model_path, args.numseqs, args.input_len,
-            use_chat_template=use_chat_template)
+            use_chat_template=use_chat_template,
+            enable_thinking=enable_thinking)
         if not token_ids:
             print("Warning: All dataset loading failed, falling back to random tokens")
             token_ids = [[randint(0, 10000) for _ in range(
@@ -282,7 +328,8 @@ def generate_benchmark_inputs(
 
     dataset_prompts = load_dataset_token_ids(
         dataset_name, model_path, args.numseqs, args.input_len,
-        use_chat_template=use_chat_template)
+        use_chat_template=use_chat_template,
+        enable_thinking=enable_thinking)
     if dataset_prompts is None:
         token_ids = [[randint(0, 10000) for _ in range(args.input_len)]
                      for _ in range(args.numseqs)]

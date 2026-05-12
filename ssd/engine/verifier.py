@@ -20,6 +20,7 @@ class Verifier(VerifierBase):
         jit_speculate: bool = False,
         tokenizer: AutoTokenizer = None,
         metrics: dict = None,
+        dflash_target_layer_ids: list[int] | None = None,
     ):
         super().__init__(lookahead, device)
         self.target_model_runner = target_model_runner
@@ -28,11 +29,22 @@ class Verifier(VerifierBase):
         self.jit_speculate = jit_speculate
         self.tokenizer = tokenizer
         self.metrics = metrics
+        self.dflash_target_layer_ids = dflash_target_layer_ids
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
-        result = self.target_model_runner.call("run", seqs, True)
+        result = self.target_model_runner.call(
+            "run",
+            seqs,
+            True,
+            True,
+            False,
+            None,
+            self.dflash_target_layer_ids,
+        )
         if eagle:
             token_ids, eagle_acts = result
+        elif self.dflash_target_layer_ids is not None:
+            token_ids, dflash_acts = result
         else:
             token_ids = result
 
@@ -49,6 +61,7 @@ class Verifier(VerifierBase):
             [], # no accepted tokens for prefill, just recovery tokens (first sampled token).
             [seq.recovery_token_id for seq in seqs],
             eagle_acts if eagle else None,
+            dflash_acts if self.dflash_target_layer_ids is not None else None,
         )
 
     def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
@@ -62,7 +75,15 @@ class Verifier(VerifierBase):
 
         _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1"
         _tv0 = perf_counter()
-        result = self.target_model_runner.call("run", seqs, False, False, True)
+        result = self.target_model_runner.call(
+            "run",
+            seqs,
+            False,
+            False,
+            True,
+            None,
+            self.dflash_target_layer_ids,
+        )
 
         if _prof:
             torch.cuda.synchronize()
@@ -75,6 +96,8 @@ class Verifier(VerifierBase):
 
         if eagle:
             logits_p_flat, eagle_acts_flat = result
+        elif self.dflash_target_layer_ids is not None:
+            logits_p_flat, dflash_acts_flat = result
         else:
             logits_p_flat = result
 
@@ -145,9 +168,13 @@ class Verifier(VerifierBase):
         eagle_acts = None
         if eagle:
             eagle_acts = eagle_acts_flat.view(batch_size, self.lookahead + 1, -1)
+        dflash_acts = None
+        if self.dflash_target_layer_ids is not None:
+            dflash_acts = dflash_acts_flat.view(batch_size, self.lookahead + 1, -1)
         
         return VerifyResult(
             new_suffixes=new_suffixes,
             recovery_tokens=recovery_tokens,
             eagle_acts=eagle_acts,
+            dflash_acts=dflash_acts,
         )

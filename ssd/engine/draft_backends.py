@@ -5,7 +5,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
+try:
+    from transformers import DynamicCache
+except ImportError:
+    from transformers.cache_utils import DynamicCache
 
 from ssd.config import Config
 from ssd.engine.helpers.speculate_types import VerifyResult
@@ -30,6 +34,13 @@ class SyncDraftBackendBase(ABC):
         pass
 
     def reset(self) -> None:
+        pass
+
+    def observe_verify(
+        self,
+        seqs: list[Sequence],
+        verify_result: VerifyResult,
+    ) -> None:
         pass
 
     def close(self) -> None:
@@ -198,6 +209,14 @@ class SwitchingDraftBackend(SyncDraftBackendBase):
         assert self._active_backend is not None
         return self._active_backend.draft(seqs, lookahead)
 
+    def observe_verify(
+        self,
+        seqs: list[Sequence],
+        verify_result: VerifyResult,
+    ) -> None:
+        assert self._active_backend is not None
+        self._active_backend.observe_verify(seqs, verify_result)
+
     def close(self) -> None:
         seen = set()
         for stage in ("warm", "primary"):
@@ -209,6 +228,165 @@ class SwitchingDraftBackend(SyncDraftBackendBase):
             self._backends[stage] = None
         self._active_backend = None
         self._active_stage = None
+
+
+class DFlashDraftBackend(SyncDraftBackendBase):
+    def __init__(self, config: Config, target_model_runner: "ModelRunner"):
+        self.config = config
+        self.device = target_model_runner.device
+        self.verbose = config.verbose
+        self.block_size = config.dflash_block_size
+        self.lookahead = config.speculate_k
+        self.mask_token_id = config.dflash_mask_token_id
+        self.target_layer_ids = config.dflash_target_layer_ids
+
+        if self.block_size is None or self.target_layer_ids is None:
+            raise ValueError("DFlash backend was initialized without resolved config")
+        if self.mask_token_id is None:
+            raise ValueError(
+                "draft_backend='dflash' requires mask_token_id in the draft "
+                "config or dflash_mask_token_id to be set explicitly"
+            )
+
+        self.target_embed_tokens = target_model_runner.model.model.embed_tokens
+        self.target_lm_head = target_model_runner.model.lm_head
+
+        torch_dtype = getattr(config.draft_hf_config, "torch_dtype", None)
+        model_kwargs = {"trust_remote_code": True}
+        if torch_dtype is not None:
+            model_kwargs["torch_dtype"] = torch_dtype
+        else:
+            model_kwargs["dtype"] = "auto"
+        self.model = AutoModel.from_pretrained(config.draft, **model_kwargs)
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.past_key_values = DynamicCache()
+        self.latest_target_hidden: torch.Tensor | None = None
+
+    def reset(self) -> None:
+        self.past_key_values = DynamicCache()
+        self.latest_target_hidden = None
+
+    def _validate_sampling_mode(self, seqs: list[Sequence], lookahead: int) -> None:
+        if len(seqs) != 1:
+            raise NotImplementedError(
+                "draft_backend='dflash' v1 supports batch size 1 only"
+            )
+        if lookahead != self.lookahead or lookahead != self.block_size - 1:
+            raise ValueError(
+                "draft_backend='dflash' v1 requires lookahead == "
+                "dflash_block_size - 1"
+            )
+        for seq in seqs:
+            draft_temp = (
+                seq.draft_temperature
+                if seq.draft_temperature is not None
+                else seq.temperature
+            )
+            if seq.temperature != 0 or draft_temp != 0:
+                raise NotImplementedError(
+                    "draft_backend='dflash' currently supports greedy decoding "
+                    "only (temperature=0, draft_temperature=0)."
+                )
+
+    def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> None:
+        self._validate_sampling_mode(seqs, self.lookahead)
+        if verify_result.dflash_acts is None:
+            raise RuntimeError(
+                "DFlash prefill requires target activations from the verifier"
+            )
+        self.past_key_values = DynamicCache()
+        acts = verify_result.dflash_acts
+        self.latest_target_hidden = acts.unsqueeze(0) if acts.dim() == 2 else acts
+
+    @torch.inference_mode()
+    def draft(
+        self,
+        seqs: list[Sequence],
+        lookahead: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_sampling_mode(seqs, lookahead)
+        if self.latest_target_hidden is None:
+            raise RuntimeError("DFlash draft called before target activations exist")
+
+        seq = seqs[0]
+        start = len(seq.token_ids) - 1
+        cache_len = int(self.past_key_values.get_seq_length())
+        block_output_ids = torch.full(
+            (1, self.block_size),
+            self.mask_token_id,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        block_output_ids[0, 0] = seq.token_ids[-1]
+        position_ids = torch.arange(
+            cache_len,
+            start + self.block_size,
+            dtype=torch.int64,
+            device=self.device,
+        ).unsqueeze(0)
+        noise_embedding = self.target_embed_tokens(block_output_ids)
+
+        draft_hidden = self.model(
+            target_hidden=self.latest_target_hidden,
+            noise_embedding=noise_embedding,
+            position_ids=position_ids,
+            past_key_values=self.past_key_values,
+            use_cache=True,
+            is_causal=False,
+        )
+        draft_hidden = draft_hidden[:, 1 - self.block_size:, :]
+        logits_q = self.target_lm_head(draft_hidden, last_only=False)
+        draft_tokens = logits_q.argmax(dim=-1)
+
+        self.past_key_values.crop(start)
+
+        tokens = draft_tokens[0].tolist()
+        seq.token_ids.extend(tokens)
+        seq.num_tokens += len(tokens)
+        seq.last_token = seq.token_ids[-1]
+
+        if self.verbose:
+            print(
+                f"[dflash_draft] generated {lookahead} draft tokens "
+                f"(block_size={self.block_size}, cache_len={cache_len}, start={start})",
+                flush=True,
+            )
+
+        return draft_tokens, logits_q
+
+    def observe_verify(
+        self,
+        seqs: list[Sequence],
+        verify_result: VerifyResult,
+    ) -> None:
+        if verify_result.dflash_acts is None:
+            raise RuntimeError(
+                "DFlash observe_verify requires target activations from verifier"
+            )
+        if len(seqs) != 1:
+            raise NotImplementedError(
+                "draft_backend='dflash' v1 supports batch size 1 only"
+            )
+        accepted_len = len(verify_result.new_suffixes[0])
+        self.latest_target_hidden = verify_result.dflash_acts[
+            :1,
+            :accepted_len,
+            :,
+        ].clone()
+
+    def close(self) -> None:
+        self.latest_target_hidden = None
+        self.past_key_values = DynamicCache()
+        if getattr(self, "model", None) is not None:
+            try:
+                del self.model
+            finally:
+                self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @dataclass

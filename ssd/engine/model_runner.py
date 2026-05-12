@@ -460,6 +460,20 @@ class ModelRunner:
             * hf_config.torch_dtype.itemsize
         )
         usable_bytes = free * config.gpu_memory_utilization
+        if (
+            not self.is_draft
+            and config.speculate
+            and config.draft_backend == "dflash"
+            and config.dflash_gpu_memory_reserve_gb > 0
+        ):
+            reserve_bytes = config.dflash_gpu_memory_reserve_gb * (1024 ** 3)
+            usable_bytes = max(usable_bytes - reserve_bytes, 0)
+            if self.verbose:
+                print(
+                    f" reserving {config.dflash_gpu_memory_reserve_gb:.2f}GB "
+                    "for DFlash draft model",
+                    flush=True,
+                )
 
         if self.is_draft and self.draft_async:
             B = config.max_num_seqs          # max concurrent sequences
@@ -592,14 +606,28 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None):
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
+        last_only: bool = True,
+        tree_decode_step: int = -1,
+        cache_hits: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        dflash_target_layer_ids: list[int] | None = None,
+    ):
         is_tree_decode = self.is_draft and self.config.draft_async and tree_decode_step >= 0
         is_mq_kp1 = self.config.speculate and not last_only
+        collect_dflash_acts = dflash_target_layer_ids is not None
         spec_and_dec = not is_prefill and self.config.speculate
 
         assert not (is_prefill and not last_only), "ERROR in run_model: is_prefill and not last_only"
+        assert not (collect_dflash_acts and self.config.use_eagle), (
+            "DFlash activation capture cannot be combined with EAGLE"
+        )
         
-        if is_prefill or self.enforce_eager:
+        if is_prefill or self.enforce_eager or collect_dflash_acts:
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             
@@ -615,8 +643,20 @@ class ModelRunner:
                     logits = self.model.compute_logits(outputs, last_only)
                     return logits, eagle_acts  # return eagle_acts as conditioning vector for draft
             else: 
-                outputs = self.model(input_ids, positions)
+                if collect_dflash_acts:
+                    outputs = self.model(
+                        input_ids,
+                        positions,
+                        dflash_target_layer_ids=dflash_target_layer_ids,
+                    )
+                else:
+                    outputs = self.model(input_ids, positions)
+                dflash_acts = None
+                if collect_dflash_acts:
+                    outputs, dflash_acts = outputs
                 logits = self.model.compute_logits(outputs, last_only)
+                if collect_dflash_acts:
+                    return logits, dflash_acts
                 return logits 
 
         elif is_tree_decode:
@@ -637,7 +677,8 @@ class ModelRunner:
         is_prefill: bool,
         last_only: bool = True,
         draft_return_logits: bool = False,
-        hidden_states: torch.Tensor | None = None
+        hidden_states: torch.Tensor | None = None,
+        dflash_target_layer_ids: list[int] | None = None,
     ) -> list[int] | tuple[list[int], torch.Tensor]:
         _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1" and not is_prefill and not last_only
         if _pt:
@@ -656,11 +697,23 @@ class ModelRunner:
 
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
         conditioning = None
+        dflash_acts = None
         if self.config.use_eagle:
             logits, conditioning = self.run_model(
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         else:
-            logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
+            result = self.run_model(
+                input_ids,
+                positions,
+                is_prefill,
+                last_only,
+                hidden_states=hidden_states,
+                dflash_target_layer_ids=dflash_target_layer_ids,
+            )
+            if dflash_target_layer_ids is not None:
+                logits, dflash_acts = result
+            else:
+                logits = result
 
         if _pt:
             torch.cuda.synchronize()
@@ -672,11 +725,14 @@ class ModelRunner:
             reset_context()
             if conditioning is not None:
                 return token_ids, conditioning
+            if dflash_acts is not None:
+                return token_ids, dflash_acts
             return (token_ids, logits) if draft_return_logits else token_ids
         else:
             reset_context()
             if conditioning is not None:
                 return logits, conditioning
+            if dflash_acts is not None:
+                return logits, dflash_acts
             return logits
     
-

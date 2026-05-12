@@ -41,6 +41,10 @@ class Config:
     block_warm_start_draft: str | None = None
     block_warm_start_keep_loaded: bool = False
     block_warm_start_draft_hf_config: AutoConfig | None = None
+    dflash_block_size: int | None = None
+    dflash_mask_token_id: int | None = None
+    dflash_target_layer_ids: list[int] | None = None
+    dflash_gpu_memory_reserve_gb: float = 3.0
     
     # async spec only
     async_fan_out: int = 3
@@ -67,9 +71,9 @@ class Config:
     def __post_init__(self):
         model = self.model 
         assert os.path.isdir(model)
-        assert self.draft_backend in {"ar", "block"}, (
+        assert self.draft_backend in {"ar", "block", "dflash"}, (
             f"Unsupported draft_backend={self.draft_backend!r}. "
-            "Expected one of: 'ar', 'block'."
+            "Expected one of: 'ar', 'block', 'dflash'."
         )
         assert self.block_draft_sampler in {"mask_predict", "remask", "first_hitting"}, (
             f"Unsupported block_draft_sampler={self.block_draft_sampler!r}. "
@@ -101,6 +105,9 @@ class Config:
             self.block_draft_forbid_token_ids = [
                 int(token_id) for token_id in self.block_draft_forbid_token_ids
             ]
+        assert self.dflash_gpu_memory_reserve_gb >= 0, (
+            "dflash_gpu_memory_reserve_gb must be non-negative"
+        )
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
         self.hf_config = AutoConfig.from_pretrained(model)
@@ -110,10 +117,61 @@ class Config:
             draft = self.draft
             self.draft_hf_config = load_config(
                 draft,
-                trust_remote_code=(self.draft_backend == "block"),
+                trust_remote_code=(self.draft_backend in {"block", "dflash"}),
             )
             if self.draft_backend == "block" and self.block_draft_block_size is None:
                 self.block_draft_block_size = self.speculate_k
+            if self.draft_backend == "dflash":
+                if self.dflash_block_size is None:
+                    self.dflash_block_size = getattr(
+                        self.draft_hf_config, "block_size", None
+                    )
+                assert self.dflash_block_size is not None, (
+                    "draft_backend='dflash' requires dflash_block_size or a "
+                    "draft config with block_size"
+                )
+                assert self.dflash_block_size >= 2, (
+                    "dflash_block_size must be >= 2"
+                )
+                assert self.speculate_k == self.dflash_block_size - 1, (
+                    "draft_backend='dflash' v1 requires speculate_k == "
+                    "dflash_block_size - 1"
+                )
+                dflash_config = getattr(self.draft_hf_config, "dflash_config", {}) or {}
+                if self.dflash_mask_token_id is None:
+                    self.dflash_mask_token_id = dflash_config.get("mask_token_id")
+                if self.dflash_target_layer_ids is None:
+                    self.dflash_target_layer_ids = dflash_config.get("target_layer_ids")
+                assert self.dflash_target_layer_ids is not None, (
+                    "draft_backend='dflash' requires target_layer_ids in the "
+                    "draft config"
+                )
+                self.dflash_target_layer_ids = [
+                    int(layer_id) for layer_id in self.dflash_target_layer_ids
+                ]
+                assert all(
+                    0 <= layer_id < self.hf_config.num_hidden_layers
+                    for layer_id in self.dflash_target_layer_ids
+                ), (
+                    "draft_backend='dflash' target_layer_ids must refer to "
+                    "target model layers"
+                )
+                assert not self.draft_async, (
+                    "draft_backend='dflash' currently only supports synchronous "
+                    "speculative decoding"
+                )
+                assert self.num_gpus == 1, (
+                    "draft_backend='dflash' v1 supports single-GPU execution only"
+                )
+                assert self.max_num_seqs == 1, (
+                    "draft_backend='dflash' v1 supports batch size 1 only"
+                )
+                assert not self.use_eagle, (
+                    "draft_backend='dflash' does not support EAGLE"
+                )
+                assert getattr(self.hf_config, "model_type", None) == "qwen3", (
+                    "draft_backend='dflash' v1 supports native Qwen3 targets only"
+                )
             self.max_model_len = min(
                 self.max_model_len, self.draft_hf_config.max_position_embeddings)
             if self.draft_backend == "block":

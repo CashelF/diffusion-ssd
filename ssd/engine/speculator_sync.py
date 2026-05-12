@@ -46,3 +46,10 @@ class SpeculatorSync(SpeculatorBase):
         speculations[:, 1:] = draft_tokens
 
         return SpeculateResult(speculations, logits_q)
+
+    def observe_verify(
+        self,
+        seqs: list[Sequence],
+        verify_result: VerifyResult,
+    ) -> None:
+        self.draft_backend.observe_verify(seqs, verify_result)

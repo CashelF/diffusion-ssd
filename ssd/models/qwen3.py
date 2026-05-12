@@ -253,12 +253,31 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        dflash_target_layer_ids: list[int] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream 
         residual = None
-        for layer in self.layers:
+        dflash_states = {}
+        dflash_layer_set = (
+            set(dflash_target_layer_ids)
+            if dflash_target_layer_ids is not None
+            else None
+        )
+        for layer_id, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if dflash_layer_set is not None and layer_id in dflash_layer_set:
+                dflash_states[layer_id] = (hidden_states + residual).to(hidden_states.dtype)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if dflash_layer_set is not None:
+            if len(dflash_states) != len(dflash_target_layer_ids):
+                raise ValueError(
+                    "Failed to collect all DFlash target activations. "
+                    f"requested={dflash_target_layer_ids}, collected={len(dflash_states)}"
+                )
+            return hidden_states, torch.cat(
+                [dflash_states[layer_id] for layer_id in dflash_target_layer_ids],
+                dim=-1,
+            )
         return hidden_states
 
 
@@ -312,8 +331,9 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
+        dflash_target_layer_ids: list[int] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = self.model(input_ids, positions, dflash_target_layer_ids)
         return hidden_states
 
     def compute_logits(

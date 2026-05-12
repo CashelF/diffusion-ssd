@@ -23,8 +23,8 @@ def parse_arguments():
     parser.add_argument("--qwen", action="store_true", help="Use Qwen models instead of Llama")
     parser.add_argument("--draft", type=str, default=None,
                         help="Draft model size (0.6 for Qwen-0.6B, 1 for Llama-1B) or path to draft model")
-    parser.add_argument("--draft-backend", type=str, choices=["ar", "block"], default="ar",
-                        help="Draft backend type: autoregressive ('ar') or block-parallel masked/diffusion-style ('block')")
+    parser.add_argument("--draft-backend", type=str, choices=["ar", "block", "dflash"], default="ar",
+                        help="Draft backend type: autoregressive ('ar'), block-parallel masked/diffusion-style ('block'), or DFlash ('dflash')")
     parser.add_argument("--block-refine-steps", type=int, default=4,
                         help="Number of parallel refinement steps for --draft-backend block")
     parser.add_argument("--block-sampler", type=str, choices=["mask_predict", "remask", "first_hitting"], default="mask_predict",
@@ -51,6 +51,12 @@ def parse_arguments():
                         help="Draft model/path to use for AR warm-start before block drafting")
     parser.add_argument("--block-warm-start-keep-loaded", action="store_true",
                         help="Keep both the warm-start drafter and block drafter loaded at once (better for multi-GPU servers, riskier on 1 GPU)")
+    parser.add_argument("--dflash-block-size", type=int, default=None,
+                        help="DFlash block size (defaults to the draft checkpoint block_size; v1 requires --k = block_size - 1)")
+    parser.add_argument("--dflash-mask-token-id", type=int, default=None,
+                        help="Override DFlash mask token id (defaults to draft config dflash_config.mask_token_id)")
+    parser.add_argument("--dflash-gpu-memory-reserve-gb", type=float, default=3.0,
+                        help="GPU memory to reserve for the DFlash draft model before allocating target KV cache")
 
     # Execution configuration
     parser.add_argument("--eager", action="store_true", help="Use eager execution (disable CUDA graphs)")
@@ -134,6 +140,16 @@ def parse_arguments():
                 "--block-warm-start-mode ar requires "
                 "--block-warm-start-draft"
             )
+    if args.draft_backend == "dflash":
+        assert args.spec, "--draft-backend dflash requires --spec"
+        assert args.draft is not None, "--draft-backend dflash requires --draft"
+        assert not getattr(args, 'async', False), "--draft-backend dflash supports sync speculation only"
+        assert not args.eagle, "--draft-backend dflash does not support EAGLE"
+        assert args.gpus == 1, "--draft-backend dflash v1 supports one GPU only"
+        assert args.b == 1, "--draft-backend dflash v1 supports batch size 1 only"
+        assert args.temp == 0.0 and args.dtemp in (None, 0.0), (
+            "--draft-backend dflash currently supports greedy decoding only"
+        )
     return args
 
 
@@ -176,10 +192,13 @@ def create_run_name(args):
                 f"_bwarm{args.block_warm_start_mode}"
                 f"{args.block_warm_start_tokens}"
             )
+    dflash_cfg_str = ""
+    if args.draft_backend == "dflash" and args.dflash_block_size is not None:
+        dflash_cfg_str = f"_dflashblk{args.dflash_block_size}"
     k_str = f"_k{args.k}"
     f_str = f"_f{args.f}"
 
-    return args.name if args.name else f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}{draft_backend_str}{block_cfg_str}{temp_str}{sampler_x_str}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}{random_str}{all_str}{gsm_str}"
+    return args.name if args.name else f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}{draft_backend_str}{block_cfg_str}{dflash_cfg_str}{temp_str}{sampler_x_str}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}{random_str}{all_str}{gsm_str}"
 
 
 def initialize_wandb(args, run_name):
@@ -219,6 +238,9 @@ def initialize_wandb(args, run_name):
             "block_warm_start_mode": args.block_warm_start_mode if args.draft_backend == "block" else None,
             "block_warm_start_tokens": args.block_warm_start_tokens if args.draft_backend == "block" else None,
             "block_warm_start_keep_loaded": args.block_warm_start_keep_loaded if args.draft_backend == "block" else None,
+            "dflash_block_size": args.dflash_block_size if args.draft_backend == "dflash" else None,
+            "dflash_mask_token_id": args.dflash_mask_token_id if args.draft_backend == "dflash" else None,
+            "dflash_gpu_memory_reserve_gb": args.dflash_gpu_memory_reserve_gb if args.draft_backend == "dflash" else None,
             "b": args.b,
             "block_size": args.block_sz,
             "eager": args.eager,
@@ -267,6 +289,9 @@ def create_llm_kwargs(args, draft_path):
         block_warm_start_tokens=args.block_warm_start_tokens,
         block_warm_start_draft=args.block_warm_start_draft,
         block_warm_start_keep_loaded=args.block_warm_start_keep_loaded,
+        dflash_block_size=args.dflash_block_size,
+        dflash_mask_token_id=args.dflash_mask_token_id,
+        dflash_gpu_memory_reserve_gb=args.dflash_gpu_memory_reserve_gb,
     )
 
     if args.flh is not None:
@@ -449,7 +474,11 @@ def main():
             async_mode = " + Async" if getattr(args, 'async', False) else ""
             jit_mode = " + JIT" if args.backup == "jit" else ""
             x_mode = f" + X({args.x})" if args.x else ""
-            draft_backend_mode = " + BlockDraft" if args.spec and args.draft_backend == "block" else ""
+            draft_backend_mode = ""
+            if args.spec and args.draft_backend == "block":
+                draft_backend_mode = " + BlockDraft"
+            elif args.spec and args.draft_backend == "dflash":
+                draft_backend_mode = " + DFlashDraft"
             full_mode = mode + spec_mode + async_mode + jit_mode + x_mode + draft_backend_mode
 
             print(f"Model: {model_name}, Mode: {full_mode}, Total: {total_tokens}tok, Time: {total_time:.2f}s, Total Throughput: {throughput:.2f}tok/s")

@@ -11,6 +11,7 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.engine.draft_backends import (
     AutoregressiveDraftBackend,
     BlockDiffusionDraftBackend,
+    DFlashDraftBackend,
     SwitchingDraftBackend,
 )
 from ssd.engine.draft_runner import DraftRunner
@@ -74,6 +75,11 @@ class LLMEngine:
                     "ERROR: target model family and block warm-start draft model "
                     "family must match"
                 )
+        elif config.speculate and config.draft_backend == "dflash":
+            assert config.draft_hf_config is not None
+            assert config.draft_hf_config.vocab_size == config.hf_config.vocab_size, (
+                "ERROR: DFlash draft model and target model must share vocab size"
+            )
 
         self.ps = []
         self.events = []
@@ -135,7 +141,7 @@ class LLMEngine:
                 self.draft_cfg = self.draft_runner.draft_cfg
                 self.sync_draft_backend = AutoregressiveDraftBackend(self.draft_runner)
                 print(f'Draft runner created on rank 0 (no async)', flush=True)
-            else:
+            elif config.draft_backend == "block":
                 self.draft_runner = None
 
                 def make_block_backend():
@@ -187,6 +193,21 @@ class LLMEngine:
                         'Block draft backend enabled (sync speculative decode, no draft KV runner)',
                         flush=True,
                     )
+            else:
+                assert config.draft_backend == "dflash"
+                self.draft_runner = None
+                self.draft_cfg = dataclasses.replace(config)
+                # DFlash maintains a Transformers DynamicCache internally; the
+                # scheduler still needs draft-side speculative block accounting.
+                self.draft_cfg.num_kvcache_blocks = config.num_kvcache_blocks
+                self.sync_draft_backend = DFlashDraftBackend(
+                    config,
+                    self.model_runner,
+                )
+                print(
+                    'DFlash draft backend enabled (sync speculative decode)',
+                    flush=True,
+                )
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -382,6 +403,11 @@ class LLMEngine:
                 jit_speculate=config.jit_speculate,
                 tokenizer=self.tokenizer,
                 metrics=METRICS,
+                dflash_target_layer_ids=(
+                    config.dflash_target_layer_ids
+                    if config.draft_backend == "dflash"
+                    else None
+                ),
             )
             return SpecDecodeStep(
                 scheduler=self.scheduler,

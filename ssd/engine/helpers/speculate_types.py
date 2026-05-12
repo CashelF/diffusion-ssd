@@ -16,6 +16,7 @@ class VerifyResult:
     new_suffixes: list[list[int]]
     recovery_tokens: list[int]
     eagle_acts: torch.Tensor | None = None  # Is this a tensor?
+    dflash_acts: torch.Tensor | None = None
 
 
 class SpeculatorBase(ABC):

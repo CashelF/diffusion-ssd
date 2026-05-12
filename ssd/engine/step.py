@@ -124,6 +124,8 @@ class SpecDecodeStep(InferenceStep):
 
         #### STEP 2: VERIFY ####
         out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
+        if not self.async_spec and hasattr(self.speculator, "observe_verify"):
+            self.speculator.observe_verify(seqs, out_verify_result)
 
         if _prof:
             torch.cuda.synchronize()
