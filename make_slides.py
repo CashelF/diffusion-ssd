@@ -127,16 +127,96 @@ add_bullets(s3, [
 
 # Slide 4: Results
 s4 = prs.slides.add_slide(blank)
-add_title(s4, "Results")
+add_title(s4, "Results: AR drafting wins at scale; BD3-LM drafter is the bottleneck")
 add_accent_bar(s4)
-placeholder = s4.shapes.add_textbox(Inches(0.7), Inches(1.7), Inches(12.0), Inches(5.0))
-tf = placeholder.text_frame
-tf.word_wrap = True
-p = tf.paragraphs[0]
-p.text = "[ results to be added ]"
-p.font.size = Pt(20)
-p.font.italic = True
-p.font.color.rgb = LIGHT
+
+# Subtitle / setup line
+setup = s4.shapes.add_textbox(Inches(0.6), Inches(1.20), Inches(12.1), Inches(0.5))
+tfx = setup.text_frame
+tfx.word_wrap = True
+px = tfx.paragraphs[0]
+px.text = "1×H100, Qwen3 family, sync SD, temp=0, 512 output tokens; humaneval / alpaca / gsm8k / ultrafeedback."
+px.font.size = Pt(14)
+px.font.italic = True
+px.font.color.rgb = LIGHT
+
+# Build a results table
+rows_data = [
+    ("Target", "Drafter", "Throughput (tok/s)", "vs baseline"),
+    ("Qwen3-1.7B", "AR baseline (no spec)", "393", "1.00×"),
+    ("Qwen3-1.7B", "Sync SD + AR draft (Qwen3-0.6B, k=6)", "285", "0.72×"),
+    ("Qwen3-1.7B", "Sync SD + BD3-LM diffusion draft (k=15)", "17", "0.04×"),
+    ("Qwen3-8B", "AR baseline (no spec)", "147", "1.00×"),
+    ("Qwen3-8B", "Sync SD + AR draft (Qwen3-0.6B, k=6)", "193", "1.31×"),
+    ("Qwen3-8B", "Sync SD + BD3-LM diffusion draft (k=15)", "20", "0.13×"),
+]
+rows, cols = len(rows_data), len(rows_data[0])
+table_shape = s4.shapes.add_table(rows, cols, Inches(0.6), Inches(1.75),
+                                  Inches(9.4), Inches(2.8))
+table = table_shape.table
+table.columns[0].width = Inches(1.6)
+table.columns[1].width = Inches(4.4)
+table.columns[2].width = Inches(2.0)
+table.columns[3].width = Inches(1.4)
+
+for r, row_vals in enumerate(rows_data):
+    for c, val in enumerate(row_vals):
+        cell = table.cell(r, c)
+        tf = cell.text_frame
+        tf.word_wrap = True
+        para = tf.paragraphs[0]
+        para.text = val
+        run = para.runs[0]
+        run.font.size = Pt(13)
+        if r == 0:
+            run.font.bold = True
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = NAVY
+        else:
+            run.font.color.rgb = GREY
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        # highlight the only winning row
+        if r == 5:
+            run.font.bold = True
+            run.font.color.rgb = ACCENT
+
+# Findings panel on the right
+findings = s4.shapes.add_textbox(Inches(10.2), Inches(1.75), Inches(2.95), Inches(5.0))
+tff = findings.text_frame
+tff.word_wrap = True
+fp = tff.paragraphs[0]
+fp.text = "Findings"
+fp.font.size = Pt(16)
+fp.font.bold = True
+fp.font.color.rgb = NAVY
+fp.space_after = Pt(6)
+
+for line in [
+    "AR-SD reaches its win regime at 8B target (1.31×). Confirms the setup is correct.",
+    "At 1.7B target, even AR-SD is net-slower; draft overhead dominates.",
+    "BD3-LM diffusion draft yields ~17–20 tok/s regardless of target size — the drafter itself is the bottleneck, not the verifier.",
+    "Block backend lacks the CUDA-graph / JIT path the AR drafter uses; 4 refine steps × 0.6B params per cycle dominate latency.",
+]:
+    p = tff.add_paragraph()
+    p.text = "•  " + line
+    p.font.size = Pt(11)
+    p.font.color.rgb = GREY
+    p.space_after = Pt(6)
+
+# Caveats footnote
+foot = s4.shapes.add_textbox(Inches(0.6), Inches(6.55), Inches(12.1), Inches(0.7))
+tfo = foot.text_frame
+tfo.word_wrap = True
+po = tfo.paragraphs[0]
+po.text = (
+    "Caveats: numseqs differs across runs (A/B = 512 prompts, A8/B8 = 256, C = 128, C8 = 64) — throughput is per-token average. "
+    "Async SSD with diffusion drafter not measured: codebase requires sync mode for --draft-backend block."
+)
+po.font.size = Pt(10)
+po.font.italic = True
+po.font.color.rgb = LIGHT
 
 out = "/Users/tishya/Desktop/Cornell/Y1S2/gen_models/project/code/diffusion-ssd/diffusion_ssd_slides.pptx"
 prs.save(out)
