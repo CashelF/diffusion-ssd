@@ -1,0 +1,18 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+We built a drop-in \emph{diffusion} draft backend for a Speculative$^2$
+Decoding engine. The drafter generates $k$ tokens in $R \ll k$ parallel
+refinement steps using a masked or block-diffusion model, and hands the
+block to the existing S$^2$D verifier unchanged, so samples remain
+exactly distributed according to the target. We support MDLM-style
+full attention and BD3LM-style staircase attention with prefix-KV reuse,
+three samplers (mask-predict, remask, first-hitting), and an AR
+warm-start.
+
+The key takeaway is that \emph{parallel block drafting only beats AR
+drafting when the per-step cost of the diffusion model is amortised
+over a long enough drafted block.} Staircase attention with prefix-KV
+caching is what makes this work: it turns the constant $R$-step
+overhead into a small fraction of the drafting cost, after which the
+diffusion drafter integrates cleanly into S$^2$D.

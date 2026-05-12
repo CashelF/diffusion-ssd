@@ -1,0 +1,70 @@
+\section{Introduction}
+\label{sec:intro}
+
+Modern large language models (LLMs) are typically deployed in an
+autoregressive (AR) regime: tokens are emitted one at a time, and each new
+token requires a forward pass through the full network. As models grow into
+the tens of billions of parameters, this sequential dependence pushes
+end-to-end decoding latency into the regime where wall-clock time is
+dominated by memory bandwidth, not compute. Reducing this latency without
+changing the output distribution is the central problem we study in this
+work.
+
+Inference is where the cost of LLMs is paid: coding copilots, chat
+assistants, and RL rollouts all sit on the same critical path of
+producing $T$ tokens from a target $M_t$ as quickly as possible while
+preserving $p_{M_t}(\cdot)$. Any technique that reduces the number of
+\emph{serial} forward passes through $M_t$ without biasing samples
+directly improves throughput and user-perceived latency. Combining two
+fast-moving lines of work, \emph{speculative decoding} and
+\emph{discrete diffusion language modeling}, is therefore a path to
+compounding speedups on real workloads.
+
+\paragraph{Related work.}
+\textbf{Speculative decoding} (SD)~\cite{leviathan2023, chen2023} couples a
+fast AR draft model $M_d$ with the target $M_t$: $M_d$ proposes $k$ tokens
+which $M_t$ verifies in a single parallel forward pass. Accepted tokens are
+kept, and a corrected token is appended at the first rejection, preserving
+$p_{M_t}$ exactly under standard rejection sampling. Speedups are
+proportional to the acceptance rate but bounded by the fact that drafting
+and verification run \emph{sequentially}. \textbf{Speculative$^2$ Decoding}
+(S$^2$D)~\cite{saguaro2024} removes this idle time by having $M_d$
+anticipate the most likely verification outcomes and pre-generate a tree of
+$f$ candidate continuations \emph{in parallel} with the target's verify
+step; if the verifier's actual decision matches one of the speculated
+branches, the next block of drafts is already in hand. \textbf{Discrete
+diffusion language models}~\cite{sahoo2024, arriola2025} take an orthogonal
+view of generation: instead of producing tokens left-to-right, they
+iteratively denoise a sequence of $[\textsc{mask}]$ tokens over a small
+number of refinement steps, generating an entire block of tokens in
+parallel. MDLM~\cite{sahoo2024} introduced a simple, scalable masked
+diffusion objective, and BD3LM~\cite{arriola2025} extended this with a
+block-causal (``staircase'') attention structure that gives the model a
+left-to-right inductive bias while keeping inside-block parallelism.
+
+\paragraph{Our approach.}
+Existing SD and S$^2$D systems treat the draft as a black box AR
+sampler, so they inherit the AR bottleneck inside the draft model itself.
+We replace the AR drafter with a discrete diffusion drafter and run it
+inside the S$^2$D loop. Concretely, at each draft step the diffusion model
+fills $k$ masked tokens in $R$ parallel refinement steps ($R \ll k$), and
+S$^2$D's lookahead tree is built on top of these diffusion-generated
+blocks. Compared to vanilla SD, drafting itself is faster (parallel rather
+than $k$-serial); compared to S$^2$D with an AR drafter, we shorten the
+critical path of each speculation cycle. As a stretch extension, we also
+experiment with a \emph{block-diffusion} drafter (BD3LM) that admits a
+staircase attention pattern and prefix-KV reuse, which is closer in spirit
+to a block-causal verifier.
+
+\paragraph{Contributions.}
+(i) We extend an open S$^2$D inference engine with a \texttt{block}
+draft backend supporting MDLM-style and BD3LM-style discrete diffusion
+drafters, three samplers (mask-predict, remask, first-hitting), and
+two attention layouts (full, staircase) with optional prefix-KV reuse
+(Sec.~\ref{sec:method}). (ii) We add a \emph{switching} drafter that
+warm-starts with an AR drafter for the first $N$ completion tokens
+before handing control to the diffusion drafter, so block diffusion is
+only paid for once it has enough context. (iii) We benchmark against
+AR, sync SD, and async S$^2$D on four datasets and compare against
+vLLM and SGLang speculative decoding
+(Sec.~\ref{sec:experiments}).

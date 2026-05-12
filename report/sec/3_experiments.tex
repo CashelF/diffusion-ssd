@@ -1,0 +1,159 @@
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+\paragraph{Hardware.} All experiments run on NVIDIA H100 80GB GPUs. We
+report numbers for the configurations \texttt{4$\times$H100} (Llama
+70B target on 4 GPUs, draft on the same set for sync SD or on a 5th GPU
+for async S$^2$D) and \texttt{1$\times$H100} (Qwen3 1.7B target with
+small draft, used for ablations).
+
+\paragraph{Models.} The autoregressive baselines pair a target
+$M_t \in \{\texttt{Llama-3.3-70B-Instruct},\texttt{Qwen3-1.7B}\}$ with an
+AR drafter $M_d^{\textsc{ar}} \in
+\{\texttt{Llama-3.2-1B-Instruct},\texttt{Qwen3-0.6B}\}$. The diffusion
+drafters are an MDLM~\cite{sahoo2024} checkpoint with full bidirectional
+attention and a BD3LM~\cite{arriola2025} checkpoint with block-causal
+attention; both are tokenized into the target's vocabulary so that
+verification needs no remapping.
+
+\paragraph{Datasets.} We evaluate on four datasets, each chosen because
+the speedup of speculative methods depends strongly on how predictable
+the data is:
+\begin{itemize}
+  \item \textbf{HumanEval}~\cite{chen2021humaneval}: Python code, very
+        predictable; expected to give the highest acceptance rates.
+  \item \textbf{Alpaca}~\cite{taori2023alpaca}: instruction-following
+        prompts with short generations.
+  \item \textbf{GSM8K}~\cite{cobbe2021gsm8k}: grade-school math word
+        problems with chain-of-thought completions.
+  \item \textbf{UltraFeedback}~\cite{cui2023ultrafeedback}: open-ended
+        dialogue, generally the hardest setting for SD.
+\end{itemize}
+Each dataset contributes $128$ prompts to the evaluation pool, for $512$
+prompts total under \texttt{--all}. We generate up to $512$ output tokens
+per prompt and use greedy decoding ($T = 0$) throughout, which is the
+regime in which exactness of SD/S$^2$D is most easily verified.
+
+\paragraph{Metrics.} We track:
+\begin{enumerate}
+  \item \textbf{End-to-end throughput (tokens/s).} Wall-clock token
+        throughput, averaged over the full prompt pool. This is the
+        metric a user actually feels, and the only one that captures the
+        full pipeline (drafting, verification, scheduling, KV cache, and
+        any speculation overhead).
+  \item \textbf{Accepted suffix length per verify step.} How many draft
+        tokens, on average, survive a single target forward pass. This
+        isolates the quality of the drafter from the rest of the engine
+        and is the right metric for comparing drafting strategies in
+        isolation. We report both the on-hit value (acceptance length
+        conditional on a hit) and the recovery-adjusted value (acceptance
+        length including miss recovery).
+  \item \textbf{Target step time (ms).} A sanity check that the
+        diffusion drafter is not slowing down the target's verify path.
+  \item \textbf{Output equivalence.} At $T=0$, all SD-family methods
+        should produce \emph{exactly} the same tokens as plain AR
+        decoding. We hash and compare completions across methods to
+        verify this; any divergence is a correctness bug, not a
+        quality--speed trade-off.
+\end{enumerate}
+Throughput is the headline metric because it is what the rest of the
+serving stack pays for; acceptance length is the headline diagnostic
+because it cleanly attributes wins or losses to the drafter.
+
+\paragraph{Baselines.} We compare against (i) AR decoding on the target
+alone, (ii) sync SD with an AR draft, (iii) async SD (S$^2$D) with an AR
+draft, and (iv) external baselines from \texttt{vLLM 0.16.0} and
+\texttt{SGLang 0.5.9} in both AR and SD modes. Our system corresponds to
+sync SD or async S$^2$D with the block draft backend swapped in.
+
+\subsection{Quantitative results}
+
+Tab.~\ref{tab:throughput-70b} compares end-to-end throughput on
+\texttt{Llama-3.3 70B} with a $1$B AR draft or our diffusion drafter, at
+batch size $1$. Numbers in the AR / SD / S$^2$D rows are the canonical
+points already reported in the engine README. Tab.~\ref{tab:throughput-qwen}
+shows the same comparison on the smaller Qwen3 stack, where we sweep
+$k \in \{6,10,15\}$ and refinement steps $R \in \{2,4\}$.
+
+\begin{table}[t]
+  \caption{End-to-end throughput on \texttt{Llama-3.3 70B}, averaged over
+  $4{\times}128 = 512$ prompts (HumanEval, Alpaca, GSM8K, UltraFeedback).
+  Greedy, $512$ output tokens, batch $1$, $4{\times}$H100; S$^2$D uses a
+  $5^{\text{th}}$ H100 for the draft. Speedups vs.\ AR baseline.}
+  \label{tab:throughput-70b}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}llrr@{}}
+    \toprule
+    Method & Draft & tok/s & Speedup \\
+    \midrule
+    AR (vLLM)             & --     & 65  & $1.0\times$ \\
+    AR (SGLang)           & --     & 65  & $1.0\times$ \\
+    SD (vLLM, $k{=}4$)    & 1B AR  & 110 & $1.7\times$ \\
+    SD (SGLang, $k{=}4$)  & 1B AR  & 170 & $2.6\times$ \\
+    S$^2$D, AR draft      & 1B AR  & 260 & $4.0\times$ \\
+    \midrule
+    Sync SD, diff. draft  & MDLM   & \todo{?} & \todo{?} \\
+    Sync SD, diff. draft  & BD3LM  & \todo{?} & \todo{?} \\
+    S$^2$D, diff. draft   & MDLM   & \todo{?} & \todo{?} \\
+    S$^2$D, diff. draft   & BD3LM  & \todo{?} & \todo{?} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \caption{Mean accepted suffix length per verify step (tokens) by
+  dataset. Target \texttt{Qwen3-1.7B}; AR drafter is
+  \texttt{Qwen3-0.6B}; block-diffusion drafter is BD3LM with staircase
+  attention, first-hitting sampler, prefix-KV cache, $R=4$. Higher is
+  better.}
+  \label{tab:throughput-qwen}
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}lcccc@{}}
+    \toprule
+    Drafter & HEval & Alpaca & GSM8K & UltraFB \\
+    \midrule
+    AR ($k{=}6$)       & \todo{?} & \todo{?} & \todo{?} & \todo{?} \\
+    BD3LM ($k{=}15$)   & \todo{?} & \todo{?} & \todo{?} & \todo{?} \\
+    BD3LM, warm-start  & \todo{?} & \todo{?} & \todo{?} & \todo{?} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Ablations.} We additionally ablate (a) the sampler
+(\texttt{mask\_predict} vs.\ \texttt{remask} vs.\ \texttt{first\_hitting}),
+(b) the number of refinement steps $R$, (c) the attention mode
+(\texttt{full} vs.\ \texttt{staircase}, the latter with prefix caching),
+and (d) the warm-start length $N$. The pattern we observe is:
+staircase attention with prefix-KV reuse is the single most important
+knob: without it, the per-step cost of the draft model wipes out the
+gain from parallel block generation. \texttt{first\_hitting} is the
+sampler that pairs best with it. \texttt{mask\_predict} is a close
+runner-up; \texttt{remask} is consistently worse because committing
+all positions every step destabilises the trajectory. (\TODO{Insert exact
+numbers from the WandB sweep.})
+
+\subsection{Qualitative results and discussion}
+
+To confirm distributional fidelity, we sample $10$ HumanEval prompts at
+$T=0$ and check that the diffusion-S$^2$D completions match the AR
+completions token-for-token. They do, which is the expected behaviour
+under SD rejection sampling and confirms the drafter does not bias the
+verifier. At $T>0$ the outputs are distributionally equivalent rather
+than identical; a large-scale $T>0$ quality study is left to future
+work.
+
+The main practical lesson is that diffusion drafting only pays off when
+the per-step cost of the diffusion forward pass is amortised across
+many drafted tokens. Two design choices matter most: (i) the
+\texttt{staircase} attention layout, because it lets us cache the
+prefix KV state and only re-run the masked block at each refinement
+step; and (ii) a long enough lookahead $k$, because the $R$-step
+refinement overhead is fixed while accepted tokens scale with $k$ when
+the data is predictable. Without either of them, the AR drafter
+remains the better default, which is consistent with what we observe
+when the warm-start length $N$ is set to zero.

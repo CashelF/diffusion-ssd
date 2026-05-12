@@ -1,0 +1,71 @@
+\begin{thebibliography}{10}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Arriola et~al.(2025)Arriola, Gokaslan, Chiu, Yang, Qi, Han, Sahoo, and
+  Kuleshov]{arriola2025}
+Marianne Arriola, Aaron Gokaslan, Justin~T Chiu, Zhihan Yang, Zhixuan Qi, Jiaqi
+  Han, Subham~Sekhar Sahoo, and Volodymyr Kuleshov.
+\newblock Block diffusion: Interpolating between autoregressive and diffusion
+  language models.
+\newblock In \emph{ICLR}, 2025.
+
+\bibitem[Chen et~al.(2023)Chen, Borgeaud, Irving, Lespiau, Sifre, and
+  Jumper]{chen2023}
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau,
+  Laurent Sifre, and John Jumper.
+\newblock Accelerating large language model decoding with speculative sampling.
+\newblock \emph{arXiv preprint arXiv:2302.01318}, 2023.
+
+\bibitem[Chen et~al.(2021)Chen, Tworek, Jun, et~al.]{chen2021humaneval}
+Mark Chen, Jerry Tworek, Heewoo Jun, et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Cobbe et~al.(2021)Cobbe, Kosaraju, Bavarian, et~al.]{cobbe2021gsm8k}
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, et~al.
+\newblock Training verifiers to solve math word problems.
+\newblock \emph{arXiv preprint arXiv:2110.14168}, 2021.
+
+\bibitem[Cui et~al.(2023)Cui, Yuan, Ding, Yao, Zhu, Ni, Xie, Liu, and
+  Sun]{cui2023ultrafeedback}
+Ganqu Cui, Lifan Yuan, Ning Ding, Guanming Yao, Wei Zhu, Yuan Ni, Guotong Xie,
+  Zhiyuan Liu, and Maosong Sun.
+\newblock {UltraFeedback}: Boosting language models with high-quality feedback.
+\newblock \emph{arXiv preprint arXiv:2310.01377}, 2023.
+
+\bibitem[Ghazvininejad et~al.(2019)Ghazvininejad, Levy, Liu, and
+  Zettlemoyer]{ghazvininejad2019}
+Marjan Ghazvininejad, Omer Levy, Yinhan Liu, and Luke Zettlemoyer.
+\newblock Mask-predict: Parallel decoding of conditional masked language
+  models.
+\newblock In \emph{Empirical Methods in Natural Language Processing (EMNLP)},
+  2019.
+
+\bibitem[Kumar et~al.(2026)Kumar, Dao, and May]{saguaro2024}
+Tanishq Kumar, Tri Dao, and Avner May.
+\newblock Speculative speculative decoding, 2026.
+
+\bibitem[Leviathan et~al.(2023)Leviathan, Kalman, and Matias]{leviathan2023}
+Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+\newblock Fast inference from transformers via speculative decoding.
+\newblock In \emph{International Conference on Machine Learning (ICML)}, 2023.
+
+\bibitem[Sahoo et~al.(2024)Sahoo, Arriola, Schiff, Gokaslan, Marroquin, Chiu,
+  Rush, and Grover]{sahoo2024}
+Subham~Sekhar Sahoo, Marianne Arriola, Yair Schiff, Aaron Gokaslan, Edgar
+  Marroquin, Justin~T Chiu, Alexander Rush, and Aditya Grover.
+\newblock Simple and effective masked diffusion language models.
+\newblock In \emph{NeurIPS}, 2024.
+
+\bibitem[Taori et~al.(2023)Taori, Gulrajani, Zhang, Dubois, Li, Guestrin,
+  Liang, and Hashimoto]{taori2023alpaca}
+Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos
+  Guestrin, Percy Liang, and Tatsunori~B. Hashimoto.
+\newblock Stanford alpaca: An instruction-following {LLaMA} model.
+\newblock \url{https://github.com/tatsu-lab/stanford_alpaca}, 2023.
+
+\end{thebibliography}
