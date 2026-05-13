@@ -401,6 +401,7 @@ class LLMEngine:
                     tokenizer=self.tokenizer,
                     verbose=config.verbose,
                     use_dflash_ssd=config.draft_backend == "dflash_ssd",
+                    dflash_universal_drafter=config.dflash_universal_drafter,
                 )
             else:
                 speculator = SpeculatorSync(

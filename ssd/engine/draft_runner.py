@@ -234,6 +234,81 @@ class DraftRunner(ModelRunner):
 
         return spec_activations
 
+    def _dflash_seed_slots(
+        self,
+        request_keys: torch.Tensor,
+        num_tokens: torch.Tensor,
+        out_logits: torch.Tensor,
+        out_tokens: torch.Tensor,
+        target_dflash_acts: torch.Tensor | None,
+        dflash_act_lengths: torch.Tensor | None,
+        slot_mask: torch.Tensor,
+        prior_tokens_per_slot: torch.Tensor | None = None,
+        slot_label: str = "miss",
+    ) -> None:
+        """Run DFlash on the rows selected by `slot_mask` and write the
+        resulting draft tokens / logits into `out_tokens` / `out_logits`.
+
+        On the universal-drafter hit path, `prior_tokens_per_slot` is the
+        cached continuation per slot (shape [B, K]); DFlash uses these as
+        a prior for the masked block. On the miss path it is None.
+        """
+        if self.dflash_seed_generator is None:
+            raise RuntimeError("DFlash seed generator is not initialized")
+        if target_dflash_acts is None or dflash_act_lengths is None:
+            raise RuntimeError(
+                "draft_backend='dflash_ssd' cache miss requires verifier "
+                "activation backlog"
+            )
+
+        slot_indices = slot_mask.nonzero(as_tuple=True)[0]
+        for row in slot_indices.tolist():
+            _profile_seed = os.environ.get("SSD_PROFILE", "0") == "1" or PROFILE_DRAFT
+            if _profile_seed:
+                torch.cuda.synchronize()
+                _seed_t0 = time.perf_counter()
+            act_len = int(dflash_act_lengths[row].item())
+            if act_len <= 0:
+                raise RuntimeError(
+                    "draft_backend='dflash_ssd' received empty DFlash "
+                    f"activation backlog for row={row} (slot_label={slot_label})"
+                )
+            self.dflash_seed_generator.set_latest_target_hidden(
+                target_dflash_acts[row:row + 1, :act_len, :]
+            )
+            start = int(num_tokens[row].item()) - 1
+            seq_id = int(request_keys[row, 0].item())
+            recovery_token_id = int(request_keys[row, 2].item())
+            prior = None
+            if prior_tokens_per_slot is not None:
+                prior = prior_tokens_per_slot[row]
+            draft_tokens, logits_q = self.dflash_seed_generator.draft_from_token(
+                recovery_token_id=recovery_token_id,
+                start=start,
+                lookahead=self.config.speculate_k,
+                seq_id=seq_id,
+                prior_tokens=prior,
+            )
+            out_tokens[row] = draft_tokens[0]
+            out_logits[row] = logits_q[0]
+            if _profile_seed:
+                torch.cuda.synchronize()
+                seed_ms = (time.perf_counter() - _seed_t0) * 1000
+                self._dflash_seed_times.append(seed_ms / 1000)
+                print(
+                    "[PROFILE draft] dflash_seed_"
+                    f"{slot_label}={seed_ms:.2f}ms seq_id={int(request_keys[row, 0].item())} "
+                    f"start={start} act_len={act_len}",
+                    flush=True,
+                )
+
+        if self.config.verbose and slot_indices.numel() > 0:
+            print(
+                f"[dflash_ssd] seeded {slot_indices.numel()} {slot_label} slot(s)",
+                flush=True,
+            )
+
+    # Back-compat alias: existing call sites still use the miss-only API.
     def _dflash_seed_misses(
         self,
         request_keys: torch.Tensor,
@@ -244,56 +319,17 @@ class DraftRunner(ModelRunner):
         dflash_act_lengths: torch.Tensor | None,
         miss_mask: torch.Tensor,
     ) -> None:
-        if self.dflash_seed_generator is None:
-            raise RuntimeError("DFlash seed generator is not initialized")
-        if target_dflash_acts is None or dflash_act_lengths is None:
-            raise RuntimeError(
-                "draft_backend='dflash_ssd' cache miss requires verifier "
-                "activation backlog"
-            )
-
-        miss_indices = miss_mask.nonzero(as_tuple=True)[0]
-        for row in miss_indices.tolist():
-            _profile_seed = os.environ.get("SSD_PROFILE", "0") == "1" or PROFILE_DRAFT
-            if _profile_seed:
-                torch.cuda.synchronize()
-                _seed_t0 = time.perf_counter()
-            act_len = int(dflash_act_lengths[row].item())
-            if act_len <= 0:
-                raise RuntimeError(
-                    "draft_backend='dflash_ssd' received empty DFlash "
-                    f"activation backlog for row={row}"
-                )
-            self.dflash_seed_generator.set_latest_target_hidden(
-                target_dflash_acts[row:row + 1, :act_len, :]
-            )
-            start = int(num_tokens[row].item()) - 1
-            seq_id = int(request_keys[row, 0].item())
-            recovery_token_id = int(request_keys[row, 2].item())
-            draft_tokens, logits_q = self.dflash_seed_generator.draft_from_token(
-                recovery_token_id=recovery_token_id,
-                start=start,
-                lookahead=self.config.speculate_k,
-                seq_id=seq_id,
-            )
-            out_tokens[row] = draft_tokens[0]
-            out_logits[row] = logits_q[0]
-            if _profile_seed:
-                torch.cuda.synchronize()
-                seed_ms = (time.perf_counter() - _seed_t0) * 1000
-                self._dflash_seed_times.append(seed_ms / 1000)
-                print(
-                    "[PROFILE draft] dflash_seed="
-                    f"{seed_ms:.2f}ms seq_id={int(request_keys[row, 0].item())} "
-                    f"start={start} act_len={act_len}",
-                    flush=True,
-                )
-
-        if self.config.verbose and miss_indices.numel() > 0:
-            print(
-                f"[dflash_ssd] seeded {miss_indices.numel()} cache miss(es)",
-                flush=True,
-            )
+        self._dflash_seed_slots(
+            request_keys=request_keys,
+            num_tokens=num_tokens,
+            out_logits=out_logits,
+            out_tokens=out_tokens,
+            target_dflash_acts=target_dflash_acts,
+            dflash_act_lengths=dflash_act_lengths,
+            slot_mask=miss_mask,
+            prior_tokens_per_slot=None,
+            slot_label="miss",
+        )
 
     def hit_cache_and_respond(
         self,
@@ -362,6 +398,7 @@ class DraftRunner(ModelRunner):
                     print(f"    [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
             
             # Fill hits
+            cached_hit_tokens = None
             if cache_hits.any():
                 # print(f'[hit_cache_and_respond] got all cache hits, using cached logits and tokens', flush=True)
                 # [B], arbitrary if no match but masked out
@@ -373,17 +410,48 @@ class DraftRunner(ModelRunner):
                 out_logits[sel] = self.tree_cache_logits[idx[sel]]
                 if self.config.use_eagle:
                     out_activations[sel] = self.tree_cache_activations[idx[sel]]
+                if (
+                    self.config.draft_backend == "dflash_ssd"
+                    and self.config.dflash_universal_drafter
+                ):
+                    # Capture cached tokens *before* DFlash overwrites them.
+                    # We need a [B, K] tensor with cached rows populated and
+                    # unused rows arbitrary (only hit-mask rows are read).
+                    cached_hit_tokens = out_tokens.clone()
 
             miss_mask = ~cache_hits.to(torch.bool)
+            hit_mask = cache_hits.to(torch.bool)
+            if (
+                self.config.draft_backend == "dflash_ssd"
+                and self.config.dflash_universal_drafter
+                and hit_mask.any()
+            ):
+                # V2: re-run DFlash on hits using the cached continuation
+                # as a prior. The AR target never generates draft tokens
+                # directly; DFlash is the universal drafter on both paths.
+                self._dflash_seed_slots(
+                    request_keys=request_keys,
+                    num_tokens=num_tokens,
+                    out_logits=out_logits,
+                    out_tokens=out_tokens,
+                    target_dflash_acts=target_dflash_acts,
+                    dflash_act_lengths=dflash_act_lengths,
+                    slot_mask=hit_mask,
+                    prior_tokens_per_slot=cached_hit_tokens,
+                    slot_label="hit",
+                )
+
             if self.config.draft_backend == "dflash_ssd" and miss_mask.any():
-                self._dflash_seed_misses(
-                    request_keys,
-                    num_tokens,
-                    out_logits,
-                    out_tokens,
-                    target_dflash_acts,
-                    dflash_act_lengths,
-                    miss_mask,
+                self._dflash_seed_slots(
+                    request_keys=request_keys,
+                    num_tokens=num_tokens,
+                    out_logits=out_logits,
+                    out_tokens=out_tokens,
+                    target_dflash_acts=target_dflash_acts,
+                    dflash_act_lengths=dflash_act_lengths,
+                    slot_mask=miss_mask,
+                    prior_tokens_per_slot=None,
+                    slot_label="miss",
                 )
             elif self.config.jit_speculate and miss_mask.any():
                 # print(f'[hit_cache_and_respond] found a cache miss, running jit speculate', flush=True)

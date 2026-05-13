@@ -26,6 +26,7 @@ class SpeculatorAsync(SpeculatorBase):
         tokenizer: AutoTokenizer,
         verbose: bool,
         use_dflash_ssd: bool = False,
+        dflash_universal_drafter: bool = False,
     ):
         super().__init__(lookahead, device)
         self.async_fan_out = async_fan_out
@@ -39,6 +40,7 @@ class SpeculatorAsync(SpeculatorBase):
         self.tokenizer = tokenizer
         self.verbose = verbose
         self.use_dflash_ssd = use_dflash_ssd
+        self.dflash_universal_drafter = dflash_universal_drafter
         self.K = lookahead
 
         # Pre-allocate handshake send/recv buffers (reused every step)
@@ -126,8 +128,13 @@ class SpeculatorAsync(SpeculatorBase):
         speculations_tokens, logits_q, cache_hits = self._speculation_request(seqs, eagle)
         if self.use_dflash_ssd:
             for seq, cache_hit in zip(seqs, cache_hits):
-                if int(cache_hit.item()) == 0:
-                    # A DFlash-seeded miss advances the DFlash cache through the
+                # In V1, only cache misses run DFlash, so only misses advance the
+                # DFlash KV cache. In V2 (universal drafter), DFlash also runs on
+                # hits, so the cache and target-activation backlog must be
+                # advanced on hits as well, or the next call will be out of sync.
+                is_miss = int(cache_hit.item()) == 0
+                if is_miss or self.dflash_universal_drafter:
+                    # A DFlash draft call advances the DFlash cache through the
                     # verified prefix before the recovery token. The verifier
                     # activations for recovery/accepted draft tokens are appended
                     # after exact verification in Scheduler.postprocess_speculate.

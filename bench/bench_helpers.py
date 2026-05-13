@@ -133,6 +133,7 @@ def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Opti
             "4": "Qwen3-4B",
             "8": "Qwen3-8B",
             "14": "Qwen3-14B",
+            "27": "Qwen3.5-27B",
             "32": "Qwen3-32B",
         }
         if args.size not in size_to_model:
@@ -210,6 +211,15 @@ def load_dataset_token_ids(
                         tokens = tokenizer.apply_chat_template(messages, **kwargs)
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)
+                # transformers>=4.59 may return BatchEncoding instead of a flat
+                # list of ints; coerce to a plain list to match downstream
+                # expectations in bench.py.
+                if hasattr(tokens, "input_ids"):
+                    tokens = tokens["input_ids"]
+                    if hasattr(tokens, "tolist"):
+                        tokens = tokens.tolist()
+                    if tokens and isinstance(tokens[0], list):
+                        tokens = tokens[0]
 
                 target_len = max(len(tokens), input_len)
 
@@ -304,10 +314,17 @@ def generate_benchmark_inputs(
                 if enable_thinking is not None:
                     kwargs["enable_thinking"] = enable_thinking
                 try:
-                    token_ids.append(tokenizer.apply_chat_template(messages, **kwargs))
+                    tok = tokenizer.apply_chat_template(messages, **kwargs)
                 except TypeError:
                     kwargs.pop("enable_thinking", None)
-                    token_ids.append(tokenizer.apply_chat_template(messages, **kwargs))
+                    tok = tokenizer.apply_chat_template(messages, **kwargs)
+                if hasattr(tok, "input_ids"):
+                    tok = tok["input_ids"]
+                    if hasattr(tok, "tolist"):
+                        tok = tok.tolist()
+                    if tok and isinstance(tok[0], list):
+                        tok = tok[0]
+                token_ids.append(tok)
             return None, token_ids, selected_prompts
         return selected_prompts, None, selected_prompts
 

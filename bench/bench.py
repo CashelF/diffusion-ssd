@@ -21,8 +21,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Benchmark SSD performance (API similar to example.py)")
 
     # Model configuration
-    parser.add_argument("--size", type=str, choices=["0.6", "1.7", "4", "8", "14", "32", "1", "3", "70"], default="70",
-                        help="Model size in billions of parameters (0.6, 1.7, 4, 8, 14, 32, 1, 3, 70)")
+    parser.add_argument("--size", type=str, choices=["0.6", "1.7", "4", "8", "14", "27", "32", "1", "3", "70"], default="70",
+                        help="Model size in billions of parameters (0.6, 1.7, 4, 8, 14, 27, 32, 1, 3, 70)")
     parser.add_argument("--llama", action="store_true", default=True, help="Use Llama models (default)")
     parser.add_argument("--qwen", action="store_true", help="Use Qwen models instead of Llama")
     parser.add_argument("--draft", type=str, default=None,
@@ -65,6 +65,8 @@ def parse_arguments():
                         help="DFlash checkpoint path/HF id for --draft-backend dflash_ssd")
     parser.add_argument("--dflash-ssd-skip-tree-cache", action="store_true",
                         help="For diagnostics, serve DFlash-seeded misses but skip async SSD tree-cache population")
+    parser.add_argument("--dflash-universal-drafter", action="store_true",
+                        help="V2: run DFlash as the drafter on BOTH cache hits AND cache misses. On a hit, the cached continuation is fed to DFlash as a prior; on a miss, DFlash drafts from masks as before. Requires --draft-backend dflash_ssd.")
 
     # Execution configuration
     parser.add_argument("--eager", action="store_true", help="Use eager execution (disable CUDA graphs)")
@@ -163,10 +165,14 @@ def parse_arguments():
         assert getattr(args, 'async', False), "--draft-backend dflash_ssd requires --async"
         assert args.dflash_draft is not None, "--draft-backend dflash_ssd requires --dflash-draft"
         assert not args.eagle, "--draft-backend dflash_ssd does not support EAGLE"
-        assert args.gpus == 2, "--draft-backend dflash_ssd v1 requires exactly 2 GPUs"
+        assert args.gpus >= 2, "--draft-backend dflash_ssd requires at least 2 GPUs (1 for draft+DFlash, rest tensor-parallel for target)"
         assert args.b == 1, "--draft-backend dflash_ssd v1 supports batch size 1 only"
         assert args.temp == 0.0 and args.dtemp in (None, 0.0), (
             "--draft-backend dflash_ssd currently supports greedy decoding only"
+        )
+    if getattr(args, "dflash_universal_drafter", False):
+        assert args.draft_backend == "dflash_ssd", (
+            "--dflash-universal-drafter requires --draft-backend dflash_ssd"
         )
     return args
 
@@ -316,6 +322,7 @@ def create_llm_kwargs(args, draft_path):
         dflash_gpu_memory_reserve_gb=args.dflash_gpu_memory_reserve_gb,
         dflash_draft=resolve_dflash_draft_path(args.dflash_draft) if args.dflash_draft else None,
         dflash_ssd_skip_tree_cache=args.dflash_ssd_skip_tree_cache,
+        dflash_universal_drafter=getattr(args, "dflash_universal_drafter", False),
     )
 
     if args.flh is not None:

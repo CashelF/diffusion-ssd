@@ -42,9 +42,9 @@ class ModelRunner:
         
         assert is_draft in [True, False], "ERROR in ModelRunner: is_draft must be True or False"
         self.is_draft = is_draft
-        if self.is_draft: 
+        if self.is_draft:
             if config.draft_hf_config.torch_dtype != config.hf_config.torch_dtype:
-                if self.verbose:
+                if config.verbose:
                     print(f"Warning: Draft dtype {config.draft_hf_config.torch_dtype} differs from target {config.hf_config.torch_dtype}. Casting draft to {config.hf_config.torch_dtype}.")
                 config.draft_hf_config.torch_dtype = config.hf_config.torch_dtype
             assert (config.draft_hf_config.vocab_size == config.hf_config.vocab_size) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
@@ -107,7 +107,17 @@ class ModelRunner:
             self.tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus))) # everyone should see the new_group init even if not in group 
 
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(self.hf_config.torch_dtype)
+        # newer transformers may store torch_dtype as a string ("bfloat16") or
+        # as `dtype` instead of `torch_dtype`. Coerce to a real torch.dtype.
+        _cfg_dtype = getattr(self.hf_config, "torch_dtype", None)
+        if _cfg_dtype is None:
+            _cfg_dtype = getattr(self.hf_config, "dtype", None)
+        if isinstance(_cfg_dtype, str):
+            _cfg_dtype = getattr(torch, _cfg_dtype)
+        if _cfg_dtype is None or not isinstance(_cfg_dtype, torch.dtype):
+            _cfg_dtype = torch.bfloat16
+        self.hf_config.torch_dtype = _cfg_dtype  # normalize for downstream code
+        torch.set_default_dtype(_cfg_dtype)
         torch.set_default_device("cuda")
         
         if self.is_draft:

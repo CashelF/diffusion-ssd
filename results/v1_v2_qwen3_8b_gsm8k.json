@@ -1,0 +1,58 @@
+{
+  "experiment": "SSD + DFlash on Qwen3-8B, GSM8K (greedy, T=0)",
+  "common_config": {
+    "target_model": "Qwen/Qwen3-8B",
+    "ar_draft_model": "Qwen/Qwen3-0.6B",
+    "dflash_model": "z-lab/Qwen3-8B-DFlash-b16",
+    "draft_backend": "dflash_ssd",
+    "mode": "async S^2D with JIT cache + DFlash seed",
+    "k_speculate": 15,
+    "dflash_block_size": 16,
+    "batch_size": 1,
+    "temperature": 0.0,
+    "draft_temperature": 0.0,
+    "num_prompts": 8,
+    "output_len": 128,
+    "total_tokens": 1024,
+    "hardware": "2x H100 (Modal, gpu='H100:2')",
+    "dataset": "GSM8K (chat-templated, first 8 prompts, thinking mode off)"
+  },
+  "results": {
+    "V1": {
+      "description": "Vanilla SSD+DFlash. On cache hit: serve cached tokens directly. On miss: DFlash drafts from all-masks.",
+      "flag": "no --dflash-universal-drafter",
+      "throughput_tok_per_s_total": 77.77,
+      "throughput_tok_per_s_decode_only": 121.0,
+      "throughput_tok_per_s_prefill": 145.0,
+      "wall_time_s": 13.17,
+      "avg_tokens_accepted_per_step_incl_recovery": 6.79,
+      "avg_cache_hit_rate": 0.83,
+      "avg_tokens_accepted_on_hit": 7.36,
+      "avg_tokens_accepted_on_miss": 4.04,
+      "avg_draft_step_ms": 52.65
+    },
+    "V2": {
+      "description": "Universal-drafter SSD+DFlash. On cache hit: DFlash re-drafts with cached tokens as a prior. On miss: same as V1.",
+      "flag": "--dflash-universal-drafter",
+      "throughput_tok_per_s_total": 31.33,
+      "throughput_tok_per_s_decode_only": 37.0,
+      "throughput_tok_per_s_prefill": 128.0,
+      "wall_time_s": 32.69,
+      "avg_tokens_accepted_per_step_incl_recovery": 2.10,
+      "avg_cache_hit_rate": 0.95,
+      "avg_tokens_accepted_on_hit": 1.97,
+      "avg_tokens_accepted_on_miss": 4.37,
+      "avg_draft_step_ms": 53.43
+    }
+  },
+  "diagnostics": {
+    "v1_acceptance_matches_dflash_paper": "V1 tokens-per-step = 6.79 is within margin of the DFlash paper's tau = 6.54 for Q3-8B GSM8K T=0 (Transformers backend), so the DFlash integration itself is correct.",
+    "v2_hit_path_is_broken": "V2 collapses hit-path acceptance from 7.36 to 1.97. Feeding cached tokens (non-mask) as a 'prior' to DFlash takes the model out of its training distribution (DFlash is trained on [anchor, mask, mask, ...]). 95% of steps go through this broken hit path, dropping overall acceptance from 6.79 to 2.10."
+  },
+  "qualitative_check": {
+    "outputs_match_AR_target_at_T0": true,
+    "example_prompt": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
+    "v1_completion_preview": "Natalia sold clips to **48 friends in April**. In **May**, she sold **half as many** clips as in April. So, in May, she sold: 48/2 = 24. To find the total ... 48 + 24 = 72. Final Answer: 72 clips.",
+    "v2_completion_preview": "(token-for-token identical to V1; SD rejection sampling guarantees losslessness)"
+  }
+}

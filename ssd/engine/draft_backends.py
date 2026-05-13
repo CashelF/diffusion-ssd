@@ -174,7 +174,16 @@ class DFlashSeedGenerator:
         start: int,
         lookahead: int,
         seq_id: int | None = None,
+        prior_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run DFlash to produce a length-`lookahead` draft block.
+
+        If `prior_tokens` is provided (V2 universal-drafter hit path), the
+        masked block is initialized with those tokens instead of all
+        mask tokens. The first position is still forced to
+        `recovery_token_id` (the verified head). The block is then refined
+        in a single forward pass conditioned on target hidden states.
+        """
         if lookahead != self.lookahead or lookahead != self.block_size - 1:
             raise ValueError(
                 "DFlash v1 requires lookahead == dflash_block_size - 1"
@@ -200,6 +209,14 @@ class DFlashSeedGenerator:
             device=self.device,
         )
         block_output_ids[0, 0] = recovery_token_id
+        if prior_tokens is not None:
+            prior_tokens = prior_tokens.to(self.device).to(torch.int64).flatten()
+            # The prior is the tokens to draft (positions 1..block_size-1).
+            # Drop anything beyond the block; if shorter, leave remaining
+            # positions as mask tokens.
+            n_prior = min(prior_tokens.numel(), self.block_size - 1)
+            if n_prior > 0:
+                block_output_ids[0, 1:1 + n_prior] = prior_tokens[:n_prior]
         position_ids = torch.arange(
             cache_len,
             start + self.block_size,

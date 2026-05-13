@@ -48,6 +48,11 @@ class Config:
     dflash_draft: str | None = None
     dflash_hf_config: AutoConfig | None = None
     dflash_ssd_skip_tree_cache: bool = False
+    # V2: when True, DFlash drafts on BOTH cache hits AND cache misses.
+    # On a hit, the cached continuation is fed to DFlash as a prior (initial
+    # block tokens) instead of an all-mask block. On a miss, behavior is
+    # identical to vanilla dflash_ssd (DFlash from all masks).
+    dflash_universal_drafter: bool = False
     
     # async spec only
     async_fan_out: int = 3
@@ -114,8 +119,16 @@ class Config:
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
         self.hf_config = AutoConfig.from_pretrained(model)
-        self.max_model_len = min(
-            self.max_model_len, self.hf_config.max_position_embeddings) 
+        # Newer Qwen variants (Qwen3.5+) nest text-config under `text_config`
+        # rather than exposing `max_position_embeddings` at the top level.
+        _max_pos = getattr(self.hf_config, "max_position_embeddings", None)
+        if _max_pos is None and hasattr(self.hf_config, "text_config"):
+            _max_pos = getattr(self.hf_config.text_config, "max_position_embeddings", None)
+        if _max_pos is None:
+            raise AttributeError(
+                f"Could not find max_position_embeddings on hf_config for {model!r}"
+            )
+        self.max_model_len = min(self.max_model_len, _max_pos)
         if self.speculate: 
             draft = self.draft
             self.draft_hf_config = load_config(
