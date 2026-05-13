@@ -26,6 +26,7 @@ class Scheduler:
         self.block_size = config.kvcache_block_size
         self.verbose = config.verbose
         self.draft_async = config.draft_async
+        self.draft_backend = config.draft_backend
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size, is_draft=False, verbose=self.verbose, max_model_len=self.max_model_len)
 
@@ -65,7 +66,12 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0 # within this round only 
         
-        while self.waiting: 
+        prefill_seq_limit = (
+            1
+            if self.draft_backend in ("dflash", "dflash_ssd")
+            else len(self.waiting)
+        )
+        while self.waiting and len(scheduled_seqs) < prefill_seq_limit:
 
             seq = self.waiting[0]
 
@@ -144,6 +150,8 @@ class Scheduler:
         seq.extend_count = 0
         seq.extend_eagle_acts = None
         seq.extend_token_ids = None
+        seq.dflash_target_hidden = None
+        seq.dflash_cached_prefix_len = None
 
     # non-speculative path, should handle completing a block here as well 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -287,7 +295,8 @@ class Scheduler:
         seqs: list[Sequence],
         new_suffixes: list[list[int]],
         next_recovery_tokens: list[int],
-        eagle_acts: torch.Tensor | None = None
+        eagle_acts: torch.Tensor | None = None,
+        dflash_acts: torch.Tensor | None = None,
     ):
 
         for i, (seq, new_suffix, next_recovery_token) in enumerate(zip(seqs, new_suffixes, next_recovery_tokens)):
@@ -319,10 +328,38 @@ class Scheduler:
                     seq.extend_eagle_acts = None
                     seq.extend_token_ids = None
 
+            if dflash_acts is not None and self.draft_backend == "dflash_ssd":
+                accepted_len = len(new_suffix)
+                if seq.dflash_cached_prefix_len is None:
+                    raise RuntimeError(
+                        "draft_backend='dflash_ssd' missing cached-prefix "
+                        f"bookkeeping while updating seq_id={seq.seq_id}"
+                    )
+                accepted_acts = dflash_acts[i, :accepted_len, :].clone()
+                if seq.dflash_target_hidden is None:
+                    seq.dflash_target_hidden = accepted_acts
+                else:
+                    seq.dflash_target_hidden = torch.cat(
+                        [seq.dflash_target_hidden, accepted_acts],
+                        dim=0,
+                    )
+                expected_backlog_len = seq.num_tokens - seq.dflash_cached_prefix_len
+                actual_backlog_len = int(seq.dflash_target_hidden.shape[0])
+                if actual_backlog_len != expected_backlog_len:
+                    raise RuntimeError(
+                        "draft_backend='dflash_ssd' activation backlog update "
+                        f"is out of sync for seq_id={seq.seq_id}: "
+                        f"cached_prefix_len={seq.dflash_cached_prefix_len}, "
+                        f"seq_len={seq.num_tokens}, "
+                        f"backlog_len={actual_backlog_len}, "
+                        f"expected={expected_backlog_len}"
+                    )
+
             if finished:
                 if __debug__: print(f'Sequence {seq.seq_id} finished, deallocating and marking as done + removing from running', flush=True)
                 seq.status = SequenceStatus.FINISHED
+                seq.dflash_target_hidden = None
+                seq.dflash_cached_prefix_len = None
                 self.block_manager.deallocate(seq)
                 self.draft_block_manager.deallocate(seq)
                 self.running.remove(seq)
-    

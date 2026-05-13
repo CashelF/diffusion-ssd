@@ -22,6 +22,7 @@ class Sequence:
         'num_draft_cached_tokens', 'temperature', 'draft_temperature', 'max_new_tokens',
         'ignore_eos', 'recovery_token_id', 'last_target_hidden_state',
         'extend_eagle_acts', 'extend_token_ids', 'extend_count',
+        'dflash_target_hidden', 'dflash_cached_prefix_len',
     ]
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
@@ -49,6 +50,8 @@ class Sequence:
         self.extend_eagle_acts = None
         self.extend_token_ids = None
         self.extend_count = 0
+        self.dflash_target_hidden = None
+        self.dflash_cached_prefix_len = None
 
     def __len__(self):
         return self.num_tokens

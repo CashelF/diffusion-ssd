@@ -95,6 +95,19 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
             return os.path.join(cache_dir, f"models--Qwen--{draft_model_name}")
 
 
+def resolve_dflash_draft_path(dflash_draft: str, cache_dir: str = HF_CACHE_DIR) -> str:
+    """Resolve a DFlash checkpoint path/HF id to a snapshot path when cached."""
+    if os.path.isdir(dflash_draft):
+        return _get_snapshot_path(dflash_draft)
+
+    cache_name = f"models--{dflash_draft.replace('/', '--')}"
+    cached_path = os.path.join(cache_dir, cache_name)
+    if os.path.isdir(cached_path):
+        return _get_snapshot_path(cached_path)
+
+    return dflash_draft
+
+
 def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Optional[str]]:
     """Resolve model and draft paths (pointing to snapshot dirs with config.json)."""
     if args.llama:
@@ -254,7 +267,7 @@ def generate_benchmark_inputs(
     - prompt_token_ids: list[list[int]] in dataset/random/all modes
     - original_prompts: for display when --example
     """
-    dflash_mode = getattr(args, "draft_backend", None) == "dflash"
+    dflash_mode = getattr(args, "draft_backend", None) in {"dflash", "dflash_ssd"}
     use_chat_template = (
         getattr(args, "chat_template", False)
         or getattr(args, "eagle", False)

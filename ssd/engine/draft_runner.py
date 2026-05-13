@@ -3,9 +3,15 @@ import time
 import torch
 import torch.distributed as dist
 import dataclasses
+import traceback
 
 from ssd.engine.model_runner import ModelRunner
 from ssd.config import Config
+from ssd.engine.draft_backends import (
+    DFlashSeedGenerator,
+    _torch_dtype_from_config,
+    load_dflash_target_embed_and_lm_head,
+)
 from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.utils.async_helpers.nccl_pack import recv_int64
@@ -24,18 +30,31 @@ class DraftRunner(ModelRunner):
         draft_cfg = dataclasses.replace(
             cfg,
             model=cfg.draft,
+            draft_backend="ar" if cfg.draft_backend == "dflash_ssd" else cfg.draft_backend,
             gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
-            tokenizer_path=cfg.model if cfg.use_eagle else None,
+            tokenizer_path=cfg.model if (cfg.use_eagle or cfg.draft_backend == "dflash_ssd") else None,
             d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
             enforce_eager=cfg.enforce_eager,
         )
+        if cfg.draft_backend == "dflash_ssd":
+            draft_cfg.draft_backend = cfg.draft_backend
+            draft_cfg.hf_config = cfg.hf_config
+            draft_cfg.dflash_draft = cfg.dflash_draft
+            draft_cfg.dflash_hf_config = cfg.dflash_hf_config
+            draft_cfg.dflash_block_size = cfg.dflash_block_size
+            draft_cfg.dflash_mask_token_id = cfg.dflash_mask_token_id
+            draft_cfg.dflash_target_layer_ids = cfg.dflash_target_layer_ids
         return draft_cfg
 
     def __init__(self, cfg: Config, rank: int = 0, init_q = None):
         self.draft_cfg = self.create_draft_config(cfg)
         self.is_draft = True # this is is_draft, use self.config.draft for the draft model path 
         self.prev_num_tokens = None
+        self.dflash_seed_generator = None
         super().__init__(self.draft_cfg, rank=rank, event=None, is_draft=True, num_tp_gpus=1, init_q=init_q)
+
+        if self.config.draft_backend == "dflash_ssd" and self.dflash_seed_generator is None:
+            self._load_dflash_seed_generator()
         
         if self.config.use_eagle:
             assert self.config.jit_speculate, \
@@ -45,8 +64,40 @@ class DraftRunner(ModelRunner):
             self._reset_tree_cache_tensors()
             self._init_prealloc_buffers()
             self._draft_step_times = []
+            self._dflash_seed_times = []
+            self._tree_cache_skips = 0
             print(f'DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
+
+    def before_allocate_kv_cache(self):
+        if self.config.draft_backend == "dflash_ssd" and self.dflash_seed_generator is None:
+            self._load_dflash_seed_generator()
+
+    def _load_dflash_seed_generator(self):
+        target_model_path = self.config.tokenizer_path
+        if target_model_path is None:
+            raise RuntimeError(
+                "draft_backend='dflash_ssd' requires target model path on "
+                "the draft runner"
+            )
+        dtype = _torch_dtype_from_config(self.config.hf_config)
+        target_embed_tokens, target_lm_head = load_dflash_target_embed_and_lm_head(
+            target_model_path,
+            device=self.device,
+            dtype=dtype,
+        )
+        self.dflash_seed_generator = DFlashSeedGenerator(
+            self.config,
+            device=self.device,
+            target_embed_tokens=target_embed_tokens,
+            target_lm_head=target_lm_head,
+            dflash_model_path=self.config.dflash_draft,
+            dflash_hf_config=self.config.dflash_hf_config,
+        )
+        print(
+            "DFlash seed generator loaded on async draft runner",
+            flush=True,
+        )
 
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
@@ -183,7 +234,79 @@ class DraftRunner(ModelRunner):
 
         return spec_activations
 
-    def hit_cache_and_respond(self, request_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations=None):
+    def _dflash_seed_misses(
+        self,
+        request_keys: torch.Tensor,
+        num_tokens: torch.Tensor,
+        out_logits: torch.Tensor,
+        out_tokens: torch.Tensor,
+        target_dflash_acts: torch.Tensor | None,
+        dflash_act_lengths: torch.Tensor | None,
+        miss_mask: torch.Tensor,
+    ) -> None:
+        if self.dflash_seed_generator is None:
+            raise RuntimeError("DFlash seed generator is not initialized")
+        if target_dflash_acts is None or dflash_act_lengths is None:
+            raise RuntimeError(
+                "draft_backend='dflash_ssd' cache miss requires verifier "
+                "activation backlog"
+            )
+
+        miss_indices = miss_mask.nonzero(as_tuple=True)[0]
+        for row in miss_indices.tolist():
+            _profile_seed = os.environ.get("SSD_PROFILE", "0") == "1" or PROFILE_DRAFT
+            if _profile_seed:
+                torch.cuda.synchronize()
+                _seed_t0 = time.perf_counter()
+            act_len = int(dflash_act_lengths[row].item())
+            if act_len <= 0:
+                raise RuntimeError(
+                    "draft_backend='dflash_ssd' received empty DFlash "
+                    f"activation backlog for row={row}"
+                )
+            self.dflash_seed_generator.set_latest_target_hidden(
+                target_dflash_acts[row:row + 1, :act_len, :]
+            )
+            start = int(num_tokens[row].item()) - 1
+            seq_id = int(request_keys[row, 0].item())
+            recovery_token_id = int(request_keys[row, 2].item())
+            draft_tokens, logits_q = self.dflash_seed_generator.draft_from_token(
+                recovery_token_id=recovery_token_id,
+                start=start,
+                lookahead=self.config.speculate_k,
+                seq_id=seq_id,
+            )
+            out_tokens[row] = draft_tokens[0]
+            out_logits[row] = logits_q[0]
+            if _profile_seed:
+                torch.cuda.synchronize()
+                seed_ms = (time.perf_counter() - _seed_t0) * 1000
+                self._dflash_seed_times.append(seed_ms / 1000)
+                print(
+                    "[PROFILE draft] dflash_seed="
+                    f"{seed_ms:.2f}ms seq_id={int(request_keys[row, 0].item())} "
+                    f"start={start} act_len={act_len}",
+                    flush=True,
+                )
+
+        if self.config.verbose and miss_indices.numel() > 0:
+            print(
+                f"[dflash_ssd] seeded {miss_indices.numel()} cache miss(es)",
+                flush=True,
+            )
+
+    def hit_cache_and_respond(
+        self,
+        request_keys,
+        B,
+        K,
+        num_tokens,
+        temperatures,
+        draft_block_tables,
+        target_recovery_activations=None,
+        target_dflash_acts=None,
+        dflash_act_lengths=None,
+    ):
         """Hits the cache (tensor-backed) and returns tensors to respond to the spec request."""
         global ttl, ttl_hit
         # Draft model now returns full target vocab size logits (after d2t expansion)
@@ -239,7 +362,7 @@ class DraftRunner(ModelRunner):
                     print(f"    [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
             
             # Fill hits
-            if (cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate):
+            if cache_hits.any():
                 # print(f'[hit_cache_and_respond] got all cache hits, using cached logits and tokens', flush=True)
                 # [B], arbitrary if no match but masked out
                 idx = match.float().argmax(dim=1).to(torch.int64)
@@ -250,7 +373,19 @@ class DraftRunner(ModelRunner):
                 out_logits[sel] = self.tree_cache_logits[idx[sel]]
                 if self.config.use_eagle:
                     out_activations[sel] = self.tree_cache_activations[idx[sel]]
-            elif self.config.jit_speculate: 
+
+            miss_mask = ~cache_hits.to(torch.bool)
+            if self.config.draft_backend == "dflash_ssd" and miss_mask.any():
+                self._dflash_seed_misses(
+                    request_keys,
+                    num_tokens,
+                    out_logits,
+                    out_tokens,
+                    target_dflash_acts,
+                    dflash_act_lengths,
+                    miss_mask,
+                )
+            elif self.config.jit_speculate and miss_mask.any():
                 # print(f'[hit_cache_and_respond] found a cache miss, running jit speculate', flush=True)
                 if self.config.verbose:
                     print(f"[hit_cache_and_respond] Running JIT speculate for cache misses", flush=True)
@@ -265,6 +400,17 @@ class DraftRunner(ModelRunner):
                     ) # write into out_logits, out_tokens
                 if self.config.use_eagle:
                     out_activations = jit_acts
+        elif self.config.draft_backend == "dflash_ssd":
+            miss_mask = torch.ones(B, dtype=torch.bool, device=self.device)
+            self._dflash_seed_misses(
+                request_keys,
+                num_tokens,
+                out_logits,
+                out_tokens,
+                target_dflash_acts,
+                dflash_act_lengths,
+                miss_mask,
+            )
         elif self.config.jit_speculate:
             # Cache is empty (first iteration), must JIT all
             if self.config.verbose:
@@ -281,6 +427,7 @@ class DraftRunner(ModelRunner):
             if self.config.use_eagle:
                 out_activations = jit_acts
             
+        cache_hits = cache_hits.to(torch.int64)
         rec_toks = request_keys[:, 2]
         
         return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits, out_activations
@@ -289,93 +436,141 @@ class DraftRunner(ModelRunner):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
         meta = self.recv_tensor((3,), torch.int64)
         B, K, F = meta.tolist()
+        response_sent = False
 
-        # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
-        max_blocks = self.config.max_blocks
-        fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
-        fused_req = recv_int64(self.async_pg, src=0,
-                               total_length=fused_total, device=self.device)
-        off = 0
-        cache_keys = fused_req[off:off + (3 * B)].view(B, 3)
-        off += 3 * B
-        seq_ids = cache_keys[:, 0]
-        num_tokens = fused_req[off:off + B].to(torch.int64)
-        off += B
-        draft_block_tables = fused_req[off:off + B *
-                                       max_blocks].view(B, max_blocks).to(torch.int32)
-        off += B * max_blocks
-        temps_as_int64 = fused_req[off:off + B]
-        off += B
-        assert off == fused_total
-        temperatures = temps_as_int64.to(torch.int32).view(torch.float32)
+        try:
+            # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
+            max_blocks = self.config.max_blocks
+            fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
+            fused_req = recv_int64(self.async_pg, src=0,
+                                   total_length=fused_total, device=self.device)
+            off = 0
+            cache_keys = fused_req[off:off + (3 * B)].view(B, 3)
+            off += 3 * B
+            seq_ids = cache_keys[:, 0]
+            num_tokens = fused_req[off:off + B].to(torch.int64)
+            off += B
+            draft_block_tables = fused_req[off:off + B *
+                                           max_blocks].view(B, max_blocks).to(torch.int32)
+            off += B * max_blocks
+            temps_as_int64 = fused_req[off:off + B]
+            off += B
+            assert off == fused_total
+            temperatures = temps_as_int64.to(torch.int32).view(torch.float32)
 
-        target_recovery_activations = torch.zeros(
-            B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
-        ) if self.config.use_eagle else None
+            target_recovery_activations = torch.zeros(
+                B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
+            ) if self.config.use_eagle else None
 
-        extend_counts = None
-        extend_eagle_acts = None
-        extend_token_ids = None
+            extend_counts = None
+            extend_eagle_acts = None
+            extend_token_ids = None
+            dflash_act_lengths = None
+            target_dflash_acts = None
 
-        if self.config.use_eagle:
-            dist.recv(target_recovery_activations, src=0, group=self.async_pg)
+            if self.config.use_eagle:
+                dist.recv(target_recovery_activations, src=0, group=self.async_pg)
 
-            # Receive extend data for fused glue decode
-            act_dim = 3 * self.config.d_model_target
-            extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
-            extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
-            extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
-            dist.recv(extend_counts, src=0, group=self.async_pg)
-            dist.recv(extend_eagle_acts, src=0, group=self.async_pg)
-            dist.recv(extend_token_ids, src=0, group=self.async_pg)
+                # Receive extend data for fused glue decode
+                act_dim = 3 * self.config.d_model_target
+                extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
+                extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
+                extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
+                dist.recv(extend_counts, src=0, group=self.async_pg)
+                dist.recv(extend_eagle_acts, src=0, group=self.async_pg)
+                dist.recv(extend_token_ids, src=0, group=self.async_pg)
+
+                if self.config.verbose:
+                    recovery_tokens_target = cache_keys[:, 2].clone()
+                    print(f"\n{'='*80}", flush=True)
+                    print(f"[CACHE REQUEST] Batch size: {B}, Spec depth: {K}", flush=True)
+                    for i in range(B):
+                        seq_id = cache_keys[i, 0].item()
+                        keep_idx = cache_keys[i, 1].item()
+                        rec_token_target = recovery_tokens_target[i].item()
+                        rec_token_text = self.tokenizer.decode([rec_token_target])
+                        n_ext = extend_counts[i].item()
+                        print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
+                    print(f"{'='*80}\n", flush=True)
+
+            if self.config.draft_backend == "dflash_ssd":
+                dflash_meta = self.recv_tensor((2,), torch.int64)
+                max_dflash_len, dflash_act_dim = dflash_meta.tolist()
+                dflash_act_lengths = self.recv_tensor((B,), torch.int64)
+                target_dflash_acts = torch.empty(
+                    B,
+                    max_dflash_len,
+                    dflash_act_dim,
+                    dtype=self.config.hf_config.torch_dtype,
+                    device=self.device,
+                )
+                dist.recv(target_dflash_acts, src=0, group=self.async_pg)
+
+            out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
+                cache_keys,
+                B,
+                K,
+                num_tokens,
+                temperatures,
+                draft_block_tables,
+                target_recovery_activations,
+                target_dflash_acts,
+                dflash_act_lengths,
+            )
 
             if self.config.verbose:
-                recovery_tokens_target = cache_keys[:, 2].clone()
-                print(f"\n{'='*80}", flush=True)
-                print(f"[CACHE REQUEST] Batch size: {B}, Spec depth: {K}", flush=True)
+                print(f"[CACHE RESPONSE]", flush=True)
                 for i in range(B):
-                    seq_id = cache_keys[i, 0].item()
-                    keep_idx = cache_keys[i, 1].item()
-                    rec_token_target = recovery_tokens_target[i].item()
-                    rec_token_text = self.tokenizer.decode([rec_token_target])
-                    n_ext = extend_counts[i].item()
-                    print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
-                print(f"{'='*80}\n", flush=True)
+                    hit_status = "HIT" if cache_hits[i].item() == 1 else "MISS"
+                    print(f"  Seq {cache_keys[i, 0].item()}: {hit_status}", flush=True)
+                    if cache_hits[i].item() == 1 or self.config.jit_speculate:
+                        tokens_list = out_tokens[i, :K].tolist()
+                        tokens_text = [self.tokenizer.decode([t]) for t in tokens_list]
+                        print(f"    Tokens: {tokens_list}", flush=True)
+                        print(f"    Detokenized: {tokens_text}", flush=True)
+                print(f"", flush=True)
 
-        out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
-            cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
+            fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
+            dist.send(fused_response, dst=0, group=self.async_pg)
+            dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
+            response_sent = True
 
-        if self.config.verbose:
-            print(f"[CACHE RESPONSE]", flush=True)
-            for i in range(B):
-                hit_status = "HIT" if cache_hits[i].item() == 1 else "MISS"
-                print(f"  Seq {cache_keys[i, 0].item()}: {hit_status}", flush=True)
-                if cache_hits[i].item() == 1 or self.config.jit_speculate:
-                    tokens_list = out_tokens[i, :K].tolist()
-                    tokens_text = [self.tokenizer.decode([t]) for t in tokens_list]
-                    print(f"    Tokens: {tokens_list}", flush=True)
-                    print(f"    Detokenized: {tokens_text}", flush=True)
-            print(f"", flush=True)
+            partial_tree_decode_args = {
+                "num_tokens": num_tokens,
+                "seq_ids": seq_ids,
+                "temperatures": temperatures,
+                "dbt": draft_block_tables,
+                "cache_hits": cache_hits,
+                "returned_tokens": out_tokens,
+                "target_recovery_activations": target_recovery_activations,
+                "previous_activations": out_activations,
+                "extend_counts": extend_counts,
+                "extend_eagle_acts": extend_eagle_acts,
+                "extend_token_ids": extend_token_ids,
+            }
 
-        fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
-        dist.send(fused_response, dst=0, group=self.async_pg)
-        dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
-
-        partial_tree_decode_args = {
-            "num_tokens": num_tokens,
-            "seq_ids": seq_ids,
-            "temperatures": temperatures,
-            "dbt": draft_block_tables,
-            "cache_hits": cache_hits,
-            "returned_tokens": out_tokens,
-            "target_recovery_activations": target_recovery_activations,
-            "previous_activations": out_activations,
-            "extend_counts": extend_counts,
-            "extend_eagle_acts": extend_eagle_acts,
-            "extend_token_ids": extend_token_ids,
-        }
-
-        return glue_decode_input_ids, partial_tree_decode_args
+            return glue_decode_input_ids, partial_tree_decode_args
+        except Exception:
+            if not response_sent:
+                print(
+                    "[draft_loop] speculation request failed before response; "
+                    "notifying target rank",
+                    flush=True,
+                )
+                traceback.print_exc()
+                cache_hits = torch.full((B,), -1, dtype=torch.int64, device=self.device)
+                out_tokens = torch.zeros((B, K), dtype=torch.int64, device=self.device)
+                out_logits = torch.zeros(
+                    (B, K, self.hf_config.vocab_size),
+                    dtype=self.hf_config.torch_dtype,
+                    device=self.device,
+                )
+                fused_response = torch.cat(
+                    [cache_hits.reshape(-1), out_tokens.reshape(-1)]
+                )
+                dist.send(fused_response, dst=0, group=self.async_pg)
+                dist.send(out_logits, dst=0, group=self.async_pg)
+            raise
 
     def prepare_prefill_ctxt(
         self,
@@ -887,29 +1082,64 @@ class DraftRunner(ModelRunner):
                     torch.cuda.synchronize()
                     _d1 = time.perf_counter()
 
-                self._reset_tree_cache_tensors()
+                if self.config.dflash_ssd_skip_tree_cache:
+                    self._reset_tree_cache_tensors()
+                    self._draft_step_times.append(time.perf_counter() - _ds0)
+                    self._tree_cache_skips += 1
+                    if _prof or PROFILE_DRAFT:
+                        torch.cuda.synchronize()
+                        _d4 = time.perf_counter()
+                        print(
+                            "[PROFILE draft] "
+                            f"service={(_d1-_d0)*1000:.2f}ms "
+                            "build_tree=SKIP decode_tree=SKIP "
+                            f"populate=SKIP total={(_d4-_d0)*1000:.2f}ms",
+                            flush=True,
+                        )
+                    if PROFILE_DRAFT:
+                        flush_draft_profile()
+                    continue
 
-                tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
+                try:
+                    self._reset_tree_cache_tensors()
 
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d2 = time.perf_counter()
+                    tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
 
-                # Decode the branch tree
-                tokens, logits, activations = self._decode_tree(tree_decode_args)
+                    if _prof or PROFILE_DRAFT:
+                        torch.cuda.synchronize()
+                        _d2 = time.perf_counter()
 
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d3 = time.perf_counter()
+                    # Decode the branch tree
+                    tokens, logits, activations = self._decode_tree(tree_decode_args)
 
-                # Populate the local cache so future spec-requests can hit
-                self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
-                self._draft_step_times.append(time.perf_counter() - _ds0)
+                    if _prof or PROFILE_DRAFT:
+                        torch.cuda.synchronize()
+                        _d3 = time.perf_counter()
 
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d4 = time.perf_counter()
-                    print(f"[PROFILE draft] service={(_d1-_d0)*1000:.2f}ms build_tree={(_d2-_d1)*1000:.2f}ms decode_tree={(_d3-_d2)*1000:.2f}ms populate={(_d4-_d3)*1000:.2f}ms total={(_d4-_d0)*1000:.2f}ms", flush=True)
+                    # Populate the local cache so future spec-requests can hit
+                    self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
+                    self._draft_step_times.append(time.perf_counter() - _ds0)
+
+                    if _prof or PROFILE_DRAFT:
+                        torch.cuda.synchronize()
+                        _d4 = time.perf_counter()
+                        print(f"[PROFILE draft] service={(_d1-_d0)*1000:.2f}ms build_tree={(_d2-_d1)*1000:.2f}ms decode_tree={(_d3-_d2)*1000:.2f}ms populate={(_d4-_d3)*1000:.2f}ms total={(_d4-_d0)*1000:.2f}ms", flush=True)
+                except Exception:
+                    print(
+                        "[draft_loop] SSD tree-cache build failed after "
+                        "serving the current DFlash/SSD response; continuing "
+                        "with an empty async cache",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                    try:
+                        reset_context()
+                    except Exception:
+                        pass
+                    self._reset_tree_cache_tensors()
+                    self._draft_step_times.append(time.perf_counter() - _ds0)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 if PROFILE_DRAFT:
                     flush_draft_profile()
@@ -921,6 +1151,11 @@ class DraftRunner(ModelRunner):
                 if self._draft_step_times:
                     avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
                     print(f"[metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
+                if self._dflash_seed_times:
+                    avg_seed_ms = sum(self._dflash_seed_times) * 1000 / len(self._dflash_seed_times)
+                    print(f"[metrics] Avg DFlash seed time (ms): {avg_seed_ms:.2f}", flush=True)
+                if self._tree_cache_skips:
+                    print(f"[metrics] SSD tree-cache skips: {self._tree_cache_skips}", flush=True)
                 self.exit()
                 break
 

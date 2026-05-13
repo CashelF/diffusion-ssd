@@ -1,10 +1,14 @@
 import gc
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from glob import glob
 from typing import TYPE_CHECKING, Callable
 
 import torch
+from safetensors import safe_open
+from torch import nn
 from transformers import AutoModel, AutoTokenizer
 try:
     from transformers import DynamicCache
@@ -18,6 +22,220 @@ from ssd.hf_remote import load_masked_lm
 
 if TYPE_CHECKING:
     from ssd.engine.model_runner import ModelRunner
+
+
+def _torch_dtype_from_config(config, default: torch.dtype = torch.bfloat16) -> torch.dtype:
+    torch_dtype = getattr(config, "torch_dtype", None)
+    if isinstance(torch_dtype, torch.dtype):
+        return torch_dtype
+    if isinstance(torch_dtype, str):
+        name = torch_dtype.removeprefix("torch.")
+        if hasattr(torch, name):
+            return getattr(torch, name)
+    return default
+
+
+def _load_weight_from_model_path(model_path: str, weight_names: list[str]) -> torch.Tensor:
+    safetensor_files = glob(os.path.join(model_path, "*.safetensors"))
+    for file in safetensor_files:
+        with safe_open(file, "pt", "cpu") as f:
+            keys = set(f.keys())
+            for weight_name in weight_names:
+                if weight_name in keys:
+                    return f.get_tensor(weight_name)
+
+    bin_files = glob(os.path.join(model_path, "pytorch_model*.bin"))
+    for file in bin_files:
+        state_dict = torch.load(file, map_location="cpu")
+        for weight_name in weight_names:
+            if weight_name in state_dict:
+                return state_dict[weight_name]
+
+    raise FileNotFoundError(
+        f"Could not find any of {weight_names} in model path {model_path}"
+    )
+
+
+def load_dflash_target_embed_and_lm_head(
+    target_model_path: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[nn.Embedding, nn.Linear]:
+    """Load only target embedding and LM head weights for DFlash on draft rank."""
+    embed_weight = _load_weight_from_model_path(
+        target_model_path,
+        ["model.embed_tokens.weight", "embed_tokens.weight"],
+    )
+    try:
+        lm_head_weight = _load_weight_from_model_path(
+            target_model_path,
+            ["lm_head.weight"],
+        )
+    except FileNotFoundError:
+        lm_head_weight = embed_weight
+
+    vocab_size, hidden_size = embed_weight.shape
+    embed_tokens = nn.Embedding(vocab_size, hidden_size, device=device, dtype=dtype)
+    embed_tokens.weight.data.copy_(embed_weight.to(device=device, dtype=dtype))
+
+    lm_head = nn.Linear(hidden_size, vocab_size, bias=False, device=device, dtype=dtype)
+    if lm_head_weight.data_ptr() == embed_weight.data_ptr():
+        lm_head.weight = embed_tokens.weight
+    else:
+        lm_head.weight.data.copy_(lm_head_weight.to(device=device, dtype=dtype))
+
+    del embed_weight
+    del lm_head_weight
+    gc.collect()
+    return embed_tokens.eval(), lm_head.eval()
+
+
+class DFlashSeedGenerator:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        device: torch.device,
+        target_embed_tokens: nn.Module,
+        target_lm_head: nn.Module,
+        dflash_model_path: str,
+        dflash_hf_config,
+    ):
+        self.config = config
+        self.device = device
+        self.verbose = config.verbose
+        self.block_size = config.dflash_block_size
+        self.lookahead = config.speculate_k
+        self.mask_token_id = config.dflash_mask_token_id
+        self.target_layer_ids = config.dflash_target_layer_ids
+        self.target_embed_tokens = target_embed_tokens
+        self.target_lm_head = target_lm_head
+
+        if self.block_size is None or self.target_layer_ids is None:
+            raise ValueError("DFlash seed generator was initialized without resolved config")
+        if self.mask_token_id is None:
+            raise ValueError(
+                "DFlash requires mask_token_id in the draft config or "
+                "dflash_mask_token_id to be set explicitly"
+            )
+
+        torch_dtype = getattr(dflash_hf_config, "torch_dtype", None)
+        model_kwargs = {"trust_remote_code": True}
+        if torch_dtype is not None:
+            model_kwargs["torch_dtype"] = torch_dtype
+        else:
+            model_kwargs["dtype"] = "auto"
+        default_device = torch.get_default_device()
+        try:
+            torch.set_default_device("cpu")
+            self.model = AutoModel.from_pretrained(dflash_model_path, **model_kwargs)
+        finally:
+            torch.set_default_device(default_device)
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.past_key_values = DynamicCache()
+        self.past_key_values_by_seq: dict[int, DynamicCache] = {}
+        self.latest_target_hidden: torch.Tensor | None = None
+        self.seed_calls = 0
+
+    def reset(self) -> None:
+        self.past_key_values = DynamicCache()
+        self.past_key_values_by_seq = {}
+        self.latest_target_hidden = None
+        self.seed_calls = 0
+
+    def _cache_for_seq(self, seq_id: int | None) -> DynamicCache:
+        if seq_id is None:
+            return self.past_key_values
+        if seq_id not in self.past_key_values_by_seq:
+            self.past_key_values_by_seq[seq_id] = DynamicCache()
+        return self.past_key_values_by_seq[seq_id]
+
+    def get_cache_len(self, seq_id: int | None = None) -> int:
+        return int(self._cache_for_seq(seq_id).get_seq_length())
+
+    def set_latest_target_hidden(self, target_hidden: torch.Tensor) -> None:
+        target_hidden = target_hidden.unsqueeze(0) if target_hidden.dim() == 2 else target_hidden
+        self.latest_target_hidden = target_hidden.to(self.device)
+
+    def _target_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        try:
+            return self.target_lm_head(hidden_states, last_only=False)
+        except TypeError:
+            return self.target_lm_head(hidden_states)
+
+    @torch.inference_mode()
+    def draft_from_token(
+        self,
+        *,
+        recovery_token_id: int,
+        start: int,
+        lookahead: int,
+        seq_id: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if lookahead != self.lookahead or lookahead != self.block_size - 1:
+            raise ValueError(
+                "DFlash v1 requires lookahead == dflash_block_size - 1"
+            )
+        if self.latest_target_hidden is None:
+            raise RuntimeError("DFlash draft called before target activations exist")
+
+        past_key_values = self._cache_for_seq(seq_id)
+        cache_len = int(past_key_values.get_seq_length())
+        expected_target_len = start - cache_len
+        if self.latest_target_hidden.shape[1] != expected_target_len:
+            raise RuntimeError(
+                "DFlash target activation backlog is out of sync with its cache: "
+                f"seq_id={seq_id}, "
+                f"cache_len={cache_len}, start={start}, "
+                f"target_hidden_len={self.latest_target_hidden.shape[1]}"
+            )
+
+        block_output_ids = torch.full(
+            (1, self.block_size),
+            self.mask_token_id,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        block_output_ids[0, 0] = recovery_token_id
+        position_ids = torch.arange(
+            cache_len,
+            start + self.block_size,
+            dtype=torch.int64,
+            device=self.device,
+        ).unsqueeze(0)
+        noise_embedding = self.target_embed_tokens(block_output_ids)
+
+        draft_hidden = self.model(
+            target_hidden=self.latest_target_hidden,
+            noise_embedding=noise_embedding,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+            is_causal=False,
+        )
+        draft_hidden = draft_hidden[:, 1 - self.block_size:, :]
+        logits_q = self._target_logits(draft_hidden)
+        draft_tokens = logits_q.argmax(dim=-1)
+
+        past_key_values.crop(start)
+        self.seed_calls += 1
+        return draft_tokens, logits_q
+
+    def close(self) -> None:
+        self.latest_target_hidden = None
+        self.past_key_values = DynamicCache()
+        self.past_key_values_by_seq = {}
+        if getattr(self, "model", None) is not None:
+            try:
+                del self.model
+            finally:
+                self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class SyncDraftBackendBase(ABC):
@@ -248,25 +466,17 @@ class DFlashDraftBackend(SyncDraftBackendBase):
                 "config or dflash_mask_token_id to be set explicitly"
             )
 
-        self.target_embed_tokens = target_model_runner.model.model.embed_tokens
-        self.target_lm_head = target_model_runner.model.lm_head
-
-        torch_dtype = getattr(config.draft_hf_config, "torch_dtype", None)
-        model_kwargs = {"trust_remote_code": True}
-        if torch_dtype is not None:
-            model_kwargs["torch_dtype"] = torch_dtype
-        else:
-            model_kwargs["dtype"] = "auto"
-        self.model = AutoModel.from_pretrained(config.draft, **model_kwargs)
-        self.model.to(self.device)
-        self.model.eval()
-
-        self.past_key_values = DynamicCache()
-        self.latest_target_hidden: torch.Tensor | None = None
+        self.seed_generator = DFlashSeedGenerator(
+            config,
+            device=self.device,
+            target_embed_tokens=target_model_runner.model.model.embed_tokens,
+            target_lm_head=target_model_runner.model.lm_head,
+            dflash_model_path=config.draft,
+            dflash_hf_config=config.dflash_hf_config or config.draft_hf_config,
+        )
 
     def reset(self) -> None:
-        self.past_key_values = DynamicCache()
-        self.latest_target_hidden = None
+        self.seed_generator.reset()
 
     def _validate_sampling_mode(self, seqs: list[Sequence], lookahead: int) -> None:
         if len(seqs) != 1:
@@ -296,9 +506,9 @@ class DFlashDraftBackend(SyncDraftBackendBase):
             raise RuntimeError(
                 "DFlash prefill requires target activations from the verifier"
             )
-        self.past_key_values = DynamicCache()
         acts = verify_result.dflash_acts
-        self.latest_target_hidden = acts.unsqueeze(0) if acts.dim() == 2 else acts
+        self.seed_generator.reset()
+        self.seed_generator.set_latest_target_hidden(acts)
 
     @torch.inference_mode()
     def draft(
@@ -307,40 +517,14 @@ class DFlashDraftBackend(SyncDraftBackendBase):
         lookahead: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._validate_sampling_mode(seqs, lookahead)
-        if self.latest_target_hidden is None:
-            raise RuntimeError("DFlash draft called before target activations exist")
-
         seq = seqs[0]
         start = len(seq.token_ids) - 1
-        cache_len = int(self.past_key_values.get_seq_length())
-        block_output_ids = torch.full(
-            (1, self.block_size),
-            self.mask_token_id,
-            dtype=torch.int64,
-            device=self.device,
+        cache_len = self.seed_generator.get_cache_len()
+        draft_tokens, logits_q = self.seed_generator.draft_from_token(
+            recovery_token_id=seq.token_ids[-1],
+            start=start,
+            lookahead=lookahead,
         )
-        block_output_ids[0, 0] = seq.token_ids[-1]
-        position_ids = torch.arange(
-            cache_len,
-            start + self.block_size,
-            dtype=torch.int64,
-            device=self.device,
-        ).unsqueeze(0)
-        noise_embedding = self.target_embed_tokens(block_output_ids)
-
-        draft_hidden = self.model(
-            target_hidden=self.latest_target_hidden,
-            noise_embedding=noise_embedding,
-            position_ids=position_ids,
-            past_key_values=self.past_key_values,
-            use_cache=True,
-            is_causal=False,
-        )
-        draft_hidden = draft_hidden[:, 1 - self.block_size:, :]
-        logits_q = self.target_lm_head(draft_hidden, last_only=False)
-        draft_tokens = logits_q.argmax(dim=-1)
-
-        self.past_key_values.crop(start)
 
         tokens = draft_tokens[0].tolist()
         seq.token_ids.extend(tokens)
@@ -370,23 +554,14 @@ class DFlashDraftBackend(SyncDraftBackendBase):
                 "draft_backend='dflash' v1 supports batch size 1 only"
             )
         accepted_len = len(verify_result.new_suffixes[0])
-        self.latest_target_hidden = verify_result.dflash_acts[
+        self.seed_generator.set_latest_target_hidden(verify_result.dflash_acts[
             :1,
             :accepted_len,
             :,
-        ].clone()
+        ].clone())
 
     def close(self) -> None:
-        self.latest_target_hidden = None
-        self.past_key_values = DynamicCache()
-        if getattr(self, "model", None) is not None:
-            try:
-                del self.model
-            finally:
-                self.model = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.seed_generator.close()
 
 
 @dataclass

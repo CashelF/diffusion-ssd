@@ -439,7 +439,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
 @torch.inference_mode()
 def capture_cudagraph(model_runner):
     config = model_runner.config
-    hf_config = config.hf_config
+    hf_config = model_runner.hf_config
     max_seqs = min(model_runner.config.max_num_seqs, 512)
     if model_runner.config.speculate and model_runner.config.draft_async and model_runner.is_draft:
         N = max_seqs * (model_runner.config.speculate_k + 1) * \
@@ -540,7 +540,7 @@ def capture_cudagraph(model_runner):
 def capture_verify_cudagraph(model_runner):
     config = model_runner.config
     # assert not model_runner.is_draft, "ERROR in capture_verify_cudagraph: verify path only supported for target model"
-    hf_config = config.hf_config
+    hf_config = model_runner.hf_config
     max_bs = min(model_runner.config.max_num_seqs, 512)
     k_plus_1 = model_runner.config.speculate_k + 1
 
@@ -691,7 +691,7 @@ def run_glue_decode_cudagraph(model_runner, input_ids, positions, last_only, gra
 def capture_glue_decode_cudagraph(model_runner):
     """Capture CG for EAGLE glue decode: FA causal + varlen cu_seqlens_q, max flat = B*(2K+1)."""
     config = model_runner.config
-    hf_config = config.hf_config
+    hf_config = model_runner.hf_config
     max_bs = min(config.max_num_seqs, 512)
     K = config.speculate_k
     two_kp1 = 2 * K + 1
@@ -777,7 +777,7 @@ def capture_glue_decode_cudagraph(model_runner):
 @torch.inference_mode()
 def capture_fi_tree_decode_cudagraph(model_runner):
     config = model_runner.config
-    hf_config = config.hf_config
+    hf_config = model_runner.hf_config
     max_bs = min(model_runner.config.max_num_seqs, 512)
     K, F = model_runner.config.speculate_k, model_runner.config.async_fan_out
     # MQ_LEN = F * (K+1)

@@ -26,7 +26,8 @@ conda create -n sglang python=3.11
 conda activate sglang
 pip install "sglang[all]==0.5.9"
 
-# vLLM 0.16.0
+# vLLM 0.16.0 for the existing draft-model SD baseline.
+# Use vLLM 0.20.1+ if running --mode dflash.
 conda create -n vllm016 python=3.11
 conda activate vllm016
 pip install "vllm==0.16.0"
@@ -118,6 +119,11 @@ conda activate vllm016
 python bench/run_vllm_bench.py --llama
 # Autoregressive baseline:
 python bench/run_vllm_bench.py --llama --mode ar
+# DFlash baseline (requires vLLM 0.20.1+):
+python bench/run_vllm_bench.py --qwen --mode dflash --tp 1 \
+    --target-model Qwen/Qwen3-8B \
+    --draft-model z-lab/Qwen3-8B-DFlash-b16 \
+    --num_draft_tokens 15
 ```
 
 ## Troubleshooting

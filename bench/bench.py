@@ -9,7 +9,11 @@ from ssd import LLM, SamplingParams
 from ssd.engine.llm_engine import METRICS
 from transformers import AutoTokenizer
 import wandb
-from bench_helpers import get_model_paths, generate_benchmark_inputs
+from bench_helpers import (
+    get_model_paths,
+    generate_benchmark_inputs,
+    resolve_dflash_draft_path,
+)
 
 
 def parse_arguments():
@@ -23,8 +27,8 @@ def parse_arguments():
     parser.add_argument("--qwen", action="store_true", help="Use Qwen models instead of Llama")
     parser.add_argument("--draft", type=str, default=None,
                         help="Draft model size (0.6 for Qwen-0.6B, 1 for Llama-1B) or path to draft model")
-    parser.add_argument("--draft-backend", type=str, choices=["ar", "block", "dflash"], default="ar",
-                        help="Draft backend type: autoregressive ('ar'), block-parallel masked/diffusion-style ('block'), or DFlash ('dflash')")
+    parser.add_argument("--draft-backend", type=str, choices=["ar", "block", "dflash", "dflash_ssd"], default="ar",
+                        help="Draft backend type: autoregressive ('ar'), block-parallel masked/diffusion-style ('block'), DFlash ('dflash'), or DFlash-seeded async SSD ('dflash_ssd')")
     parser.add_argument("--block-refine-steps", type=int, default=4,
                         help="Number of parallel refinement steps for --draft-backend block")
     parser.add_argument("--block-sampler", type=str, choices=["mask_predict", "remask", "first_hitting"], default="mask_predict",
@@ -57,6 +61,10 @@ def parse_arguments():
                         help="Override DFlash mask token id (defaults to draft config dflash_config.mask_token_id)")
     parser.add_argument("--dflash-gpu-memory-reserve-gb", type=float, default=3.0,
                         help="GPU memory to reserve for the DFlash draft model before allocating target KV cache")
+    parser.add_argument("--dflash-draft", type=str, default=None,
+                        help="DFlash checkpoint path/HF id for --draft-backend dflash_ssd")
+    parser.add_argument("--dflash-ssd-skip-tree-cache", action="store_true",
+                        help="For diagnostics, serve DFlash-seeded misses but skip async SSD tree-cache population")
 
     # Execution configuration
     parser.add_argument("--eager", action="store_true", help="Use eager execution (disable CUDA graphs)")
@@ -150,6 +158,16 @@ def parse_arguments():
         assert args.temp == 0.0 and args.dtemp in (None, 0.0), (
             "--draft-backend dflash currently supports greedy decoding only"
         )
+    if args.draft_backend == "dflash_ssd":
+        assert args.spec, "--draft-backend dflash_ssd requires --spec"
+        assert getattr(args, 'async', False), "--draft-backend dflash_ssd requires --async"
+        assert args.dflash_draft is not None, "--draft-backend dflash_ssd requires --dflash-draft"
+        assert not args.eagle, "--draft-backend dflash_ssd does not support EAGLE"
+        assert args.gpus == 2, "--draft-backend dflash_ssd v1 requires exactly 2 GPUs"
+        assert args.b == 1, "--draft-backend dflash_ssd v1 supports batch size 1 only"
+        assert args.temp == 0.0 and args.dtemp in (None, 0.0), (
+            "--draft-backend dflash_ssd currently supports greedy decoding only"
+        )
     return args
 
 
@@ -193,8 +211,10 @@ def create_run_name(args):
                 f"{args.block_warm_start_tokens}"
             )
     dflash_cfg_str = ""
-    if args.draft_backend == "dflash" and args.dflash_block_size is not None:
+    if args.draft_backend in {"dflash", "dflash_ssd"} and args.dflash_block_size is not None:
         dflash_cfg_str = f"_dflashblk{args.dflash_block_size}"
+    if args.draft_backend == "dflash_ssd" and args.dflash_ssd_skip_tree_cache:
+        dflash_cfg_str += "_skipssd"
     k_str = f"_k{args.k}"
     f_str = f"_f{args.f}"
 
@@ -238,9 +258,11 @@ def initialize_wandb(args, run_name):
             "block_warm_start_mode": args.block_warm_start_mode if args.draft_backend == "block" else None,
             "block_warm_start_tokens": args.block_warm_start_tokens if args.draft_backend == "block" else None,
             "block_warm_start_keep_loaded": args.block_warm_start_keep_loaded if args.draft_backend == "block" else None,
-            "dflash_block_size": args.dflash_block_size if args.draft_backend == "dflash" else None,
-            "dflash_mask_token_id": args.dflash_mask_token_id if args.draft_backend == "dflash" else None,
-            "dflash_gpu_memory_reserve_gb": args.dflash_gpu_memory_reserve_gb if args.draft_backend == "dflash" else None,
+            "dflash_block_size": args.dflash_block_size if args.draft_backend in {"dflash", "dflash_ssd"} else None,
+            "dflash_mask_token_id": args.dflash_mask_token_id if args.draft_backend in {"dflash", "dflash_ssd"} else None,
+            "dflash_gpu_memory_reserve_gb": args.dflash_gpu_memory_reserve_gb if args.draft_backend in {"dflash", "dflash_ssd"} else None,
+            "dflash_draft": args.dflash_draft if args.draft_backend == "dflash_ssd" else None,
+            "dflash_ssd_skip_tree_cache": args.dflash_ssd_skip_tree_cache if args.draft_backend == "dflash_ssd" else None,
             "b": args.b,
             "block_size": args.block_sz,
             "eager": args.eager,
@@ -292,6 +314,8 @@ def create_llm_kwargs(args, draft_path):
         dflash_block_size=args.dflash_block_size,
         dflash_mask_token_id=args.dflash_mask_token_id,
         dflash_gpu_memory_reserve_gb=args.dflash_gpu_memory_reserve_gb,
+        dflash_draft=resolve_dflash_draft_path(args.dflash_draft) if args.dflash_draft else None,
+        dflash_ssd_skip_tree_cache=args.dflash_ssd_skip_tree_cache,
     )
 
     if args.flh is not None:
@@ -479,6 +503,8 @@ def main():
                 draft_backend_mode = " + BlockDraft"
             elif args.spec and args.draft_backend == "dflash":
                 draft_backend_mode = " + DFlashDraft"
+            elif args.spec and args.draft_backend == "dflash_ssd":
+                draft_backend_mode = " + DFlashSSD"
             full_mode = mode + spec_mode + async_mode + jit_mode + x_mode + draft_backend_mode
 
             print(f"Model: {model_name}, Mode: {full_mode}, Total: {total_tokens}tok, Time: {total_time:.2f}s, Total Throughput: {throughput:.2f}tok/s")

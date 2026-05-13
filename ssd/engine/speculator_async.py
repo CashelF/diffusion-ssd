@@ -25,6 +25,7 @@ class SpeculatorAsync(SpeculatorBase):
         draft_runner_rank: int,
         tokenizer: AutoTokenizer,
         verbose: bool,
+        use_dflash_ssd: bool = False,
     ):
         super().__init__(lookahead, device)
         self.async_fan_out = async_fan_out
@@ -37,6 +38,7 @@ class SpeculatorAsync(SpeculatorBase):
         self.draft_runner_rank = draft_runner_rank
         self.tokenizer = tokenizer
         self.verbose = verbose
+        self.use_dflash_ssd = use_dflash_ssd
         self.K = lookahead
 
         # Pre-allocate handshake send/recv buffers (reused every step)
@@ -61,6 +63,7 @@ class SpeculatorAsync(SpeculatorBase):
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
+        dflash_acts = verify_result.dflash_acts
         input_id_list = [seq.token_ids for seq in seqs]
 
         # EAGLE token-conditioning shift: token at position j gets conditioning
@@ -75,6 +78,20 @@ class SpeculatorAsync(SpeculatorBase):
                 offset += seq_len
             eagle_acts = torch.cat(sliced, dim=0)
             input_id_list = [ids[1:] for ids in input_id_list]
+        if self.use_dflash_ssd:
+            if dflash_acts is None:
+                raise RuntimeError(
+                    "draft_backend='dflash_ssd' prefill requires DFlash "
+                    "target activations from the verifier"
+                )
+            if dflash_acts.dim() == 3:
+                dflash_acts = dflash_acts.reshape(-1, dflash_acts.shape[-1])
+            offset = 0
+            for seq in seqs:
+                seq_len = len(seq.token_ids)
+                seq.dflash_target_hidden = dflash_acts[offset:offset + seq_len].clone()
+                seq.dflash_cached_prefix_len = 0
+                offset += seq_len
 
         max_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
         cmd, metadata, input_ids, num_tokens, draft_block_table, eagle_acts = prepare_prefill_payload(
@@ -107,6 +124,15 @@ class SpeculatorAsync(SpeculatorBase):
 
         eagle = verify_result.eagle_acts is not None
         speculations_tokens, logits_q, cache_hits = self._speculation_request(seqs, eagle)
+        if self.use_dflash_ssd:
+            for seq, cache_hit in zip(seqs, cache_hits):
+                if int(cache_hit.item()) == 0:
+                    # A DFlash-seeded miss advances the DFlash cache through the
+                    # verified prefix before the recovery token. The verifier
+                    # activations for recovery/accepted draft tokens are appended
+                    # after exact verification in Scheduler.postprocess_speculate.
+                    seq.dflash_cached_prefix_len = seq.num_tokens - 1
+                    seq.dflash_target_hidden = None
 
         # Build speculations using pre-allocated buffers (avoids torch.tensor(device=cuda) sync)
         B = len(seqs)
@@ -178,10 +204,72 @@ class SpeculatorAsync(SpeculatorBase):
             dist.send(extend_eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
             dist.send(extend_token_ids, dst=self.draft_runner_rank, group=self.async_pg)
 
+        if self.use_dflash_ssd:
+            dflash_segments = []
+            for seq in seqs:
+                if seq.dflash_target_hidden is None:
+                    raise RuntimeError(
+                        "draft_backend='dflash_ssd' missing verifier activation "
+                        f"backlog for seq_id={seq.seq_id}"
+                    )
+                if seq.dflash_cached_prefix_len is None:
+                    raise RuntimeError(
+                        "draft_backend='dflash_ssd' missing cached-prefix "
+                        f"bookkeeping for seq_id={seq.seq_id}"
+                    )
+                # num_tokens includes the just-appended recovery token, while
+                # DFlash's cached prefix and activation backlog stop before it.
+                dflash_start = seq.num_tokens - 1
+                expected_backlog_len = dflash_start - seq.dflash_cached_prefix_len
+                actual_backlog_len = int(seq.dflash_target_hidden.shape[0])
+                if actual_backlog_len != expected_backlog_len:
+                    raise RuntimeError(
+                        "draft_backend='dflash_ssd' activation backlog is out "
+                        f"of sync for seq_id={seq.seq_id}: "
+                        f"cached_prefix_len={seq.dflash_cached_prefix_len}, "
+                        f"start={dflash_start}, "
+                        f"backlog_len={actual_backlog_len}, "
+                        f"expected={expected_backlog_len}"
+                    )
+                if self.verbose:
+                    print(
+                        "[dflash_ssd] request "
+                        f"seq_id={seq.seq_id} cached_prefix_len="
+                        f"{seq.dflash_cached_prefix_len} start={dflash_start} "
+                        f"backlog_len={actual_backlog_len}",
+                        flush=True,
+                    )
+                dflash_segments.append(seq.dflash_target_hidden.to(self.device))
+            act_dim = dflash_segments[0].shape[-1]
+            max_len = max(segment.shape[0] for segment in dflash_segments)
+            dflash_meta = torch.tensor([max_len, act_dim], dtype=torch.int64, device=self.device)
+            dflash_lengths = torch.tensor(
+                [segment.shape[0] for segment in dflash_segments],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            dflash_acts = torch.zeros(
+                B,
+                max_len,
+                act_dim,
+                dtype=self.draft_dtype,
+                device=self.device,
+            )
+            for i, segment in enumerate(dflash_segments):
+                dflash_acts[i, :segment.shape[0]] = segment.to(self.draft_dtype)
+            dist.send(dflash_meta, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(dflash_lengths, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(dflash_acts, dst=self.draft_runner_rank, group=self.async_pg)
+
         # Recv into pre-allocated buffers
         dist.recv(self._fused_response, src=self.draft_runner_rank, group=self.async_pg)
         cache_hits = self._fused_response[:B]
         speculations = self._fused_response[B:].view(B, self.K)
         dist.recv(self._logits_q, src=self.draft_runner_rank, group=self.async_pg)
+        if (cache_hits < 0).any():
+            raise RuntimeError(
+                "Async draft runner reported a fatal speculation-request "
+                "failure; see draft-rank logs for the traceback"
+            )
 
         return speculations, self._logits_q, cache_hits

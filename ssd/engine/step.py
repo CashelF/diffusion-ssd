@@ -63,6 +63,7 @@ class SpecDecodeStep(InferenceStep):
         eagle: bool,
         tokenizer: AutoTokenizer,
         async_spec: bool,
+        dflash: bool = False,
     ):
         super().__init__(scheduler)
         self.speculator = speculator
@@ -70,10 +71,12 @@ class SpecDecodeStep(InferenceStep):
         self.eagle = eagle
         self.tokenizer = tokenizer
         self.async_spec = async_spec
+        self.dflash = dflash
 
     def prefill(self, seqs: list[Sequence]) -> int:
-        # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
-        if not self.eagle and self.async_spec:
+        # When doing async speculation and not Eagle/DFlash, draft and target
+        # prefills can run in parallel.
+        if not self.eagle and not self.dflash and self.async_spec:
             empty_verify_result = VerifyResult([], [], None)
             self.speculator.prefill(seqs, empty_verify_result)
             verify_result = self.verifier.prefill(seqs, eagle=False)
@@ -152,6 +155,7 @@ class SpecDecodeStep(InferenceStep):
             out_verify_result.new_suffixes,
             out_verify_result.recovery_tokens,
             eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+            dflash_acts=out_verify_result.dflash_acts if self.dflash else None,
         )
 
         if _prof:

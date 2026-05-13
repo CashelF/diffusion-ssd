@@ -14,6 +14,8 @@ def main():
     parser.add_argument("--llama", action="store_true", default=True)
     parser.add_argument("--qwen", action="store_true")
     parser.add_argument("--draft", type=str, default="1")
+    parser.add_argument("--model-path", type=str, default=None,
+                        help="Tokenizer/model path or HF id served by vLLM. Overrides --size/--llama/--qwen path resolution.")
     parser.add_argument("--input_len", type=int, default=128)
     parser.add_argument("--output_len", type=int, default=512)
     parser.add_argument("--numseqs", type=int, default=128)
@@ -42,7 +44,10 @@ def main():
     assert r.status_code == 200, f"Server not reachable at {url}"
     print(f"Server OK at {url}")
 
-    _, model_path, _ = get_model_paths(args)
+    if args.model_path is not None:
+        model_path = args.model_path
+    else:
+        _, model_path, _ = get_model_paths(args)
     string_prompts, prompt_token_ids, _ = generate_benchmark_inputs(args, model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 

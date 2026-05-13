@@ -51,6 +51,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dflash-draft", type=str, default=_default_dflash_draft())
     parser.add_argument("--system-prompt", type=str, default="You are a helpful assistant.")
     parser.add_argument("--user-prompt", type=str, default="Introduce yourself briefly.")
+    parser.add_argument(
+        "--user-prompts-json",
+        type=str,
+        default=None,
+        help="Optional JSON list of user prompts. Overrides --user-prompt.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--speculate-k", type=int, default=15)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
@@ -70,6 +76,30 @@ def _accepted_fraction(accepted_suffix_lens: list[int], speculate_k: int) -> flo
     return (avg_tokens_per_step - 1.0) / speculate_k
 
 
+def _build_prompt_ids(args: argparse.Namespace, tokenizer) -> list[list[int]]:
+    user_prompts = (
+        json.loads(args.user_prompts_json)
+        if args.user_prompts_json is not None
+        else [args.user_prompt]
+    )
+    if not isinstance(user_prompts, list) or not all(
+        isinstance(prompt, str) for prompt in user_prompts
+    ):
+        raise ValueError("--user-prompts-json must be a JSON list of strings")
+    return [
+        tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": args.system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        for prompt in user_prompts
+    ]
+
+
 def _run_single_mode(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
@@ -77,21 +107,13 @@ def _run_single_mode(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     from ssd import LLM, SamplingParams
 
     tokenizer = AutoTokenizer.from_pretrained(args.target, use_fast=True)
-    prompt_ids = tokenizer.apply_chat_template(
-        [
-            {"role": "system", "content": args.system_prompt},
-            {"role": "user", "content": args.user_prompt},
-        ],
-        tokenize=True,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    prompt_ids_list = _build_prompt_ids(args, tokenizer)
 
     print(f"=== {mode.upper()} RUN ===", flush=True)
     print(f"TARGET {args.target}", flush=True)
     if mode == "dflash":
         print(f"DFLASH_DRAFT {args.dflash_draft}", flush=True)
-    print(f"PROMPT_LEN {len(prompt_ids)}", flush=True)
+    print(f"PROMPT_LENS {[len(prompt_ids) for prompt_ids in prompt_ids_list]}", flush=True)
 
     llm_kwargs = dict(
         num_gpus=1,
@@ -115,32 +137,36 @@ def _run_single_mode(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     t0 = perf_counter()
     try:
         outputs, metrics = llm.generate(
-            [prompt_ids],
+            prompt_ids_list,
             [SamplingParams(
                 temperature=0.0,
                 draft_temperature=0.0,
                 ignore_eos=True,
                 max_new_tokens=args.max_new_tokens,
-            )],
+            ) for _ in prompt_ids_list],
             use_tqdm=False,
         )
     finally:
         llm.exit(hard=False)
     total_time = perf_counter() - t0
 
-    output = outputs[0]
     accepted_suffix = metrics.get("accepted_suffix_lens_with_recovery", [])
-    decode_tokens = len(output["token_ids"])
+    all_token_ids = [output["token_ids"] for output in outputs]
+    texts = [output["text"] for output in outputs]
+    decode_tokens = sum(len(token_ids) for token_ids in all_token_ids)
     result = {
         "mode": mode,
         "target": args.target,
         "dflash_draft": args.dflash_draft if mode == "dflash" else None,
-        "prompt_len": len(prompt_ids),
+        "prompt_lens": [len(prompt_ids) for prompt_ids in prompt_ids_list],
+        "num_prompts": len(prompt_ids_list),
         "decode_tokens": decode_tokens,
         "total_time_s": total_time,
         "end_to_end_tok_s": decode_tokens / total_time if total_time > 0 else None,
-        "token_ids": output["token_ids"],
-        "text": output["text"],
+        "token_ids": all_token_ids[0] if len(all_token_ids) == 1 else all_token_ids,
+        "text": texts[0] if len(texts) == 1 else texts,
+        "all_token_ids": all_token_ids,
+        "texts": texts,
         "accepted_suffix_lens_with_recovery": accepted_suffix,
         "avg_tokens_per_step_incl_recovery": (
             sum(accepted_suffix) / len(accepted_suffix) if accepted_suffix else None
@@ -171,6 +197,8 @@ def _child_args(args: argparse.Namespace, mode: str) -> list[str]:
         "--max-model-len", str(args.max_model_len),
         "--kvcache-block-size", str(args.kvcache_block_size),
     ]
+    if args.user_prompts_json is not None:
+        cmd.extend(["--user-prompts-json", args.user_prompts_json])
     if args.eager:
         cmd.append("--eager")
     if args.verbose_engine:
@@ -211,8 +239,8 @@ def _compare(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "target": args.target,
         "dflash_draft": args.dflash_draft,
-        "same_final_token_ids": ar["token_ids"] == dflash["token_ids"],
-        "same_final_text": ar["text"] == dflash["text"],
+        "same_final_token_ids": ar["all_token_ids"] == dflash["all_token_ids"],
+        "same_final_text": ar["texts"] == dflash["texts"],
         "speedup_vs_ar": (
             dflash["end_to_end_tok_s"] / ar["end_to_end_tok_s"]
             if ar["end_to_end_tok_s"] and dflash["end_to_end_tok_s"]

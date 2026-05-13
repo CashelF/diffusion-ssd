@@ -9,11 +9,14 @@ dist/
 *.egg-info/
 
 # Virtual environments
+.conda/
+.conda-pkgs/
 .venv/
 venv/
 env/
 
 # Test / type / lint caches
+.cache/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

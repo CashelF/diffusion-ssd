@@ -80,6 +80,20 @@ class LLMEngine:
             assert config.draft_hf_config.vocab_size == config.hf_config.vocab_size, (
                 "ERROR: DFlash draft model and target model must share vocab size"
             )
+        elif config.speculate and config.draft_backend == "dflash_ssd":
+            assert config.draft_hf_config is not None
+            assert config.dflash_hf_config is not None
+            assert config.draft_hf_config.vocab_size == config.hf_config.vocab_size, (
+                "ERROR: SSD draft model and target model must share vocab size"
+            )
+            assert config.dflash_hf_config.vocab_size == config.hf_config.vocab_size, (
+                "ERROR: DFlash draft model and target model must share vocab size"
+            )
+            target_family = infer_model_family(config.model)
+            draft_family = infer_model_family(config.draft)
+            assert target_family == draft_family, (
+                "ERROR: target model family and SSD draft model family must match"
+            )
 
         self.ps = []
         self.events = []
@@ -386,6 +400,7 @@ class LLMEngine:
                     draft_runner_rank=self.num_tp_gpus,
                     tokenizer=self.tokenizer,
                     verbose=config.verbose,
+                    use_dflash_ssd=config.draft_backend == "dflash_ssd",
                 )
             else:
                 speculator = SpeculatorSync(
@@ -405,7 +420,7 @@ class LLMEngine:
                 metrics=METRICS,
                 dflash_target_layer_ids=(
                     config.dflash_target_layer_ids
-                    if config.draft_backend == "dflash"
+                    if config.draft_backend in {"dflash", "dflash_ssd"}
                     else None
                 ),
             )
@@ -416,6 +431,7 @@ class LLMEngine:
                 eagle=config.use_eagle,
                 tokenizer=self.tokenizer,
                 async_spec=config.draft_async,
+                dflash=config.draft_backend in {"dflash", "dflash_ssd"},
             )
         else:
             return AutoRegressiveStep(

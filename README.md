@@ -59,7 +59,10 @@ Set paths via environment variables. `SSD_HF_CACHE` should point to the HuggingF
 ```bash
 export SSD_HF_CACHE=/path/to/huggingface/hub
 export SSD_DATASET_DIR=/path/to/processed_datasets
-export SSD_CUDA_ARCH=9.0   # 9.0=H100, 8.0=A100, 8.9=L40/4090
+export SSD_CUDA_ARCH=9.0   # 9.0=H100, 8.6=A6000, 8.0=A100, 8.9=L40/4090
+export FLASHINFER_WORKSPACE_BASE=$PWD
+export TRITON_CACHE_DIR=$PWD/.cache/triton
+export TORCHINDUCTOR_CACHE_DIR=$PWD/.cache/torchinductor
 ```
 
 ### Download models + datasets

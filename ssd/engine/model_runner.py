@@ -267,13 +267,10 @@ class ModelRunner:
         if self.verbose:
             print(f'-----WARMING UP {model_type}MODEL----', flush=True)
         self.warmup_model()
+        self.before_allocate_kv_cache()
         if self.verbose:
             print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
         self.allocate_kv_cache()
-        if init_q is not None:
-            # super().__init__() runs warmup and calculates num_kvcache_blocks, pass that up
-            init_q.put(self.config.num_kvcache_blocks)
-            init_q.close()
 
         if not self.enforce_eager:
             # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate): 
@@ -301,7 +298,16 @@ class ModelRunner:
                 self.graphs["glue_decode"] = glue_graphs
                 self.graph_bs_list["glue_decode"] = glue_bs_list
 
+        if init_q is not None:
+            # Signal readiness only after all draft-side initialization has completed.
+            init_q.put(self.config.num_kvcache_blocks)
+            init_q.close()
+
         return model_type
+
+    def before_allocate_kv_cache(self):
+        """Hook for subclasses that need to reserve/load auxiliary GPU state."""
+        return None
 
     def exit(self, hard: bool = True):
         # Idempotent
@@ -472,6 +478,20 @@ class ModelRunner:
                 print(
                     f" reserving {config.dflash_gpu_memory_reserve_gb:.2f}GB "
                     "for DFlash draft model",
+                    flush=True,
+                )
+        if (
+            self.is_draft
+            and config.draft_async
+            and config.draft_backend == "dflash_ssd"
+            and config.dflash_gpu_memory_reserve_gb > 0
+        ):
+            reserve_bytes = config.dflash_gpu_memory_reserve_gb * (1024 ** 3)
+            usable_bytes = max(usable_bytes - reserve_bytes, 0)
+            if self.verbose:
+                print(
+                    f" reserving {config.dflash_gpu_memory_reserve_gb:.2f}GB "
+                    "for DFlash seed generator",
                     flush=True,
                 )
 

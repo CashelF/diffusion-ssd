@@ -7,6 +7,7 @@ Usage:
     python run_vllm_bench.py --llama                      # SD, Llama 70B
     python run_vllm_bench.py --qwen                       # SD, Qwen 32B
     python run_vllm_bench.py --llama --mode ar             # autoregressive baseline
+    python run_vllm_bench.py --qwen --mode dflash          # DFlash, Qwen3-8B default
     python run_vllm_bench.py --llama --wandb --name myrun  # log to wandb
 
 Set model paths via env vars (BENCH_LLAMA_70B, etc.) or edit bench_paths.py.
@@ -25,11 +26,30 @@ from bench_paths import MODELS, resolve_snapshot
 
 
 def get_server_cmd(args):
-    if args.llama:
+    if args.target_model is not None:
+        target = resolve_snapshot(args.target_model)
+    elif args.mode == "dflash":
+        target = (
+            "meta-llama/Llama-3.1-8B-Instruct"
+            if args.llama else
+            "Qwen/Qwen3-8B"
+        )
+    elif args.llama:
         target = resolve_snapshot(MODELS["llama_70b"])
-        draft = resolve_snapshot(MODELS["llama_1b"])
     else:
         target = resolve_snapshot(MODELS["qwen_32b"])
+
+    if args.draft_model is not None:
+        draft = resolve_snapshot(args.draft_model)
+    elif args.mode == "dflash":
+        draft = (
+            "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
+            if args.llama else
+            "z-lab/Qwen3-8B-DFlash-b16"
+        )
+    elif args.llama:
+        draft = resolve_snapshot(MODELS["llama_1b"])
+    else:
         draft = resolve_snapshot(MODELS["qwen_0.6b"])
 
     cmd = [
@@ -49,6 +69,16 @@ def get_server_cmd(args):
             "num_speculative_tokens": args.num_draft_tokens,
             "method": "draft_model",
         }
+        cmd += ["--speculative-config", json.dumps(spec_config)]
+    elif args.mode == "dflash":
+        # DFlash requires vLLM v0.20.1+.
+        spec_config = {
+            "model": draft,
+            "num_speculative_tokens": args.num_draft_tokens,
+            "method": "dflash",
+        }
+        if args.dflash_attention_backend is not None:
+            spec_config["attention_backend"] = args.dflash_attention_backend
         cmd += ["--speculative-config", json.dumps(spec_config)]
     # mode == "ar": no speculative flags, just serve the target model.
 
@@ -78,12 +108,19 @@ def main():
     parser = argparse.ArgumentParser(description="Launch vLLM server and benchmark it")
     parser.add_argument("--llama", action="store_true", default=True)
     parser.add_argument("--qwen", action="store_true")
-    parser.add_argument("--mode", choices=["ar", "sd"], default="sd",
-                        help="ar = autoregressive, sd = speculative decoding (default)")
+    parser.add_argument("--mode", choices=["ar", "sd", "dflash"], default="sd",
+                        help="ar = autoregressive, sd = draft-model speculative decoding, dflash = DFlash speculative decoding")
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--port", type=int, default=40020)
     parser.add_argument("--mem_frac", type=float, default=0.90)
-    parser.add_argument("--num_draft_tokens", type=int, default=5)
+    parser.add_argument("--num_draft_tokens", type=int, default=None,
+                        help="Speculative draft tokens. Defaults to 5 for --mode sd and 15 for --mode dflash.")
+    parser.add_argument("--target-model", type=str, default=None,
+                        help="Override target model path/HF id. Useful for DFlash models not covered by --llama/--qwen.")
+    parser.add_argument("--draft-model", type=str, default=None,
+                        help="Override draft model path/HF id. For --mode dflash this should be a z-lab/*-DFlash model.")
+    parser.add_argument("--dflash-attention-backend", type=str, default=None,
+                        help="Optional DFlash speculative-config attention_backend passed through to vLLM.")
     # Pass-through to eval client
     parser.add_argument("--numseqs", type=int, default=128)
     parser.add_argument("--output_len", type=int, default=512)
@@ -94,6 +131,8 @@ def main():
     args = parser.parse_args()
     if args.qwen:
         args.llama = False
+    if args.num_draft_tokens is None:
+        args.num_draft_tokens = 15 if args.mode == "dflash" else 5
 
     server_cmd, target = get_server_cmd(args)
     print(f"Mode: {args.mode}, Target: {target}")
@@ -112,14 +151,16 @@ def main():
         print("Server ready")
 
         bench_dir = os.path.dirname(__file__)
+        eval_size = "8" if args.mode == "dflash" else ("70" if args.llama else "32")
         eval_cmd = [
             sys.executable, os.path.join(bench_dir, "vllm_eval_client.py"),
-            "--size", "70" if args.llama else "32",
+            "--size", eval_size,
             "--numseqs", str(args.numseqs),
             "--output_len", str(args.output_len),
             "--temp", str(args.temp),
             "--all", "--b", "1",
             "--port", str(args.port),
+            "--model-path", target,
         ]
         if args.llama:
             eval_cmd.append("--llama")
