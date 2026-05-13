@@ -1,0 +1,65 @@
+\section{Introduction}
+\label{sec:intro}
+
+Autoregressive (AR) large language model inference is sequential: each
+generated token depends on the full prefix, and each step therefore requires
+another target-model forward pass. This is especially costly for verifier
+models in the tens of billions of parameters, where latency is dominated by
+memory movement and KV-cache traffic rather than by abundant GPU arithmetic.
+Speculative decoding (SD) reduces the number of serial target forwards by
+using a cheaper draft model to propose $k$ future tokens and verifying those
+tokens in one target pass~\cite{leviathan2023, chen2023}. The resulting
+accept/reject rule is lossless: the final sequence is distributed exactly as
+if it had been sampled from the target.
+
+Speculative$^2$ Decoding (S$^2$D), implemented as Saguaro, attacks the next
+source of idle time~\cite{saguaro2024}. In ordinary SD, the draft model waits
+while the target verifies, and the target then waits while the draft prepares
+the next block. S$^2$D places the draft model on separate hardware and asks it
+to predict likely verification outcomes while the target is busy. If the
+actual outcome is one of the precomputed branches, the next draft is ready
+immediately. The method is attractive because it can improve the
+throughput-latency frontier without changing the verifier or giving up exact
+sampling.
+
+This report asks whether diffusion language models are a good replacement for
+the AR drafter inside S$^2$D. The motivation is straightforward. Discrete
+diffusion language models denoise masked tokens in parallel
+~\cite{sahoo2024, arriola2025}, so a diffusion drafter appears to remove the
+inner AR bottleneck from the draft side. If one block forward could replace
+$k$ serial AR draft steps, S$^2$D could use its separate draft GPU more
+effectively and cache likely future branches faster.
+
+Our experiments show that this idea is more subtle. Conventional masked or
+block-diffusion drafters do not behave like a one-pass block oracle. To get
+usable draft quality, they require several denoising/refinement forwards and,
+in the quality regime, the number of refinement passes can approach the number
+of tokens generated in the block. In S$^2$D this cost is paid on the draft
+critical path and can dominate the very latency S$^2$D is meant to hide. In
+our implementation, the traditional block-diffusion backend peaked around
+$20$ tokens/s and was not competitive with AR draft baselines.
+
+DFlash changes the trade-off~\cite{chen2026dflash}. Rather than asking a
+standalone diffusion model to infer the next block from tokens alone, DFlash
+conditions a lightweight block-diffusion drafter on hidden activations
+extracted from the target verifier. This target-conditioned design produces a
+whole speculative block in a single draft pass and has published speedups on
+Qwen3-8B and Qwen3-Coder-30B-A3B using SGLang~\cite{zheng2024sglang}. We
+therefore extended our study beyond conventional block diffusion and
+implemented a DFlash-seeded S$^2$D hybrid. We also decouple the DFlash block
+length from the S$^2$D tree depth: the DFlash checkpoint still produces its
+native 15-token block, but the SSD verifier and tree cache may consume a
+shorter prefix of that block to reduce draft-side work.
+
+\paragraph{Contributions.}
+First, we integrated MDLM-style and BD3LM-style drafters into an S$^2$D
+inference engine and measured why they do not provide useful speedups in this
+setting. Second, we implemented a DFlash hybrid in which DFlash serves
+S$^2$D speculation-cache misses using fresh verifier activations, while the
+normal AR S$^2$D drafter serves cache hits and prepares the future tree cache.
+Third, we identify the main systems bottleneck: diffusion drafting is useful
+only when the verifier is sufficiently slower than the draft path to amortize
+cross-GPU communication, scheduling, tree-cache construction, and fallback
+logic. On small verifier models, those overheads erase the advantage. Finally,
+we outline the larger-model experiment needed to decide whether DFlash+S$^2$D
+is worthwhile under representative serving conditions.

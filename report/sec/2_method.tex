@@ -1,0 +1,122 @@
+\section{Method}
+\label{sec:method}
+
+\subsection{Background}
+
+\paragraph{Speculative decoding.}
+Given prefix $x_{\le t}$, a draft model $M_d$ proposes
+$\hat{x}_{t+1:t+k}$ autoregressively. The target model $M_t$ then evaluates
+the drafted positions in one forward pass and accepts each token according to
+the standard rejection-sampling rule
+$\min(1, p_{M_t}(\hat{x}_i)/p_{M_d}(\hat{x}_i))$~\cite{leviathan2023,
+chen2023}. At the first rejection, SD samples a corrected token from the
+residual distribution. Under this rule, SD changes latency but not the output
+distribution.
+
+\paragraph{Speculative$^2$ decoding.}
+S$^2$D keeps the target and draft on separate devices~\cite{saguaro2024}.
+While the target verifies the current speculation, the draft predicts likely
+verification outcomes $(a, r)$, where $a$ is the number of accepted draft
+tokens and $r$ is the recovery or bonus token. It then precomputes
+continuations for those outcomes and stores them in a speculation cache. A
+cache hit eliminates the next drafting wait; a cache miss falls back to a
+synchronous or just-in-time draft.
+
+\paragraph{Discrete diffusion drafters.}
+Masked diffusion language models iteratively replace mask tokens with
+predictions~\cite{sahoo2024}. Block diffusion adds a block-causal attention
+pattern, often called staircase attention, so that a sequence is generated
+block by block while positions inside the current block are denoised in
+parallel~\cite{arriola2025}. These models are bidirectional inside the open
+block, so only fully committed prefix blocks are safe to reuse in a KV cache;
+the partially filled open block must be recomputed with accepted tokens
+clamped and unresolved positions masked.
+
+\subsection{Traditional block diffusion in \texorpdfstring{S$^2$D}{S2D}}
+
+Our first integration adds a \texttt{block} draft backend with three samplers:
+mask-predict~\cite{ghazvininejad2019}, remask, and first-hitting. Given a
+prefix and lookahead $k$, the backend constructs
+\[
+  [x_{\le t}, \underbrace{\textsc{mask},\ldots,\textsc{mask}}_{k}]
+\]
+and runs $R$ refinement forwards. Each forward predicts logits for all masked
+positions, commits a subset of tokens according to the sampler, and reuses or
+recomputes the open block as required by the attention pattern. We implemented
+both full bidirectional attention and staircase attention with prefix-cache
+reuse for committed blocks.
+
+This is the most direct diffusion replacement for an AR drafter, but it is
+not the right systems trade-off. In practice, useful drafts require multiple
+diffusion forwards. The draft cost is therefore not one block pass; it is
+approximately
+\[
+  T_{\mathrm{draft}} \approx R \cdot T_{\mathrm{diffusion\_forward}},
+\]
+plus cache construction and transfer overhead. When $R$ becomes large enough
+to produce acceptable tokens, this can approach the cost of generating the
+block token-by-token with a small AR drafter. Since S$^2$D only helps if the
+draft path can be hidden under target verification, this iterative diffusion
+cost becomes a bottleneck.
+
+\subsection{DFlash-seeded \texorpdfstring{S$^2$D}{S2D}}
+
+DFlash addresses the quality-latency problem by conditioning a lightweight
+block-diffusion drafter on target hidden states~\cite{chen2026dflash}. The
+target verifier already computes rich activations during prefill and verify;
+DFlash concatenates selected target-layer residual streams, injects those
+features into the draft model's KV cache, and predicts the next block from a
+recovery token followed by mask tokens. The DFlash checkpoint we target,
+\texttt{z-lab/Qwen3-8B-DFlash-b16}, has block size $16$, so our v1 path uses
+$15$ native DFlash draft tokens. For synchronous DFlash, this fixes the
+speculation lookahead at $k=15$. For the DFlash+S$^2$D hybrid, however, we
+separate the DFlash lookahead from the SSD lookahead. Cache misses always ask
+DFlash for the full 15-token block required by the checkpoint, while the SSD
+response may expose only the first $k_{\mathrm{SSD}}$ tokens and logits to the
+verifier. This keeps the DFlash checkpoint geometry unchanged while allowing
+the SSD tree depth, fan-out buffers, and tree-cache work to shrink.
+
+We integrate DFlash with S$^2$D as a miss handler rather than replacing the
+whole S$^2$D loop. The hybrid works as follows.
+
+\begin{enumerate}
+  \item The verifier runs the target model and returns logits, recovery
+        tokens, and DFlash target activations.
+  \item The async draft process receives a speculation-cache request keyed by
+        the sequence id, accepted depth, and recovery token.
+  \item On a cache hit, S$^2$D returns the normal cached AR-draft branch.
+  \item On a cache miss, DFlash receives the verifier activation backlog,
+        builds $[\text{recovery}, \textsc{mask}^{15}]$, and produces a
+        15-token draft block using the target embedding and LM head. In the
+        split-lookahead variant, the async response slices this block to the
+        first $k_{\mathrm{SSD}}$ positions before target verification.
+  \item After the exact verifier accepts or rejects the proposed block, the
+        scheduler appends only the verified target activations to the DFlash
+        backlog and crops the DFlash cache back to the verified prefix.
+  \item In parallel, the existing S$^2$D AR drafter continues constructing the
+        tree cache for future likely verification outcomes.
+\end{enumerate}
+
+The important design choice is that DFlash is used only when the S$^2$D tree
+cache misses. Hits keep the original S$^2$D fast path, where precomputed AR
+branches are returned immediately. Misses avoid the weakest fallback of
+ordinary S$^2$D, namely waiting for a full just-in-time AR draft, and instead
+use the verifier-conditioned DFlash model to provide the next block.
+
+\subsection{Correctness and v1 restrictions}
+
+Both block diffusion and DFlash are still draft mechanisms: the target
+verifier remains exact. At greedy temperature zero, matching AR outputs
+token-for-token is the correctness test. For stochastic decoding, the same SD
+residual rule would preserve the target distribution, but our implementation
+currently focuses on greedy decoding to isolate systems behavior.
+
+The current DFlash+S$^2$D prototype intentionally supports only batch size
+$1$, two GPUs, Qwen3-style target activations, and greedy decoding. The
+verifier and drafter are placed on separate visible GPUs. The synchronous
+DFlash diagnostic path is single-GPU and keeps the DFlash-native $k=15$
+lookahead. The async hybrid additionally maintains DFlash KV state and target
+activation backlogs per sequence id, so multiple independent benchmark
+requests do not share stale DFlash cache state. This is sufficient to test the
+central systems question: can a one-pass target-conditioned diffusion block
+drafter make S$^2$D cache misses cheaper than AR fallback?

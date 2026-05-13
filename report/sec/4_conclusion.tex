@@ -1,0 +1,36 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+We investigated whether diffusion drafters are a good fit for
+Speculative$^2$ Decoding. The direct approach--replacing the AR drafter with a
+traditional masked or block-diffusion model--did not work well. Although block
+diffusion predicts many positions per forward pass, practical generation still
+requires many refinement passes. In our system this made the diffusion
+drafter, not the verifier, the bottleneck, with throughput around $20$
+tokens/s.
+
+DFlash is a better match to the problem because it uses target activations
+from the verifier and drafts a full block in one conditioned pass. We
+implemented a DFlash-seeded S$^2$D hybrid in which DFlash serves
+speculation-cache misses and the normal AR S$^2$D drafter serves cache hits
+and prepares the future tree cache. This preserves exact verification and
+keeps the fast S$^2$D hit path intact. Our initial local Qwen3-8B prototype
+was not fast, reaching $11.68$ tokens/s with $34.48$ ms DFlash seed latency
+and $79$ ms SSD tree-decode latency, but it isolated the right next
+bottlenecks.
+Moving the same prototype to a Modal H100 environment and decoupling the
+DFlash seed length from the SSD lookahead improved a matched two-H100
+diagnostic from $31.15$ to $32.82$ tokens/s, mostly by reducing draft-side
+tree work. This is not a final serving result, but it makes the bottleneck
+more specific: the hybrid is dominated by tree-cache construction and
+orchestration unless the verifier is large enough to hide those costs.
+
+The broader conclusion is that S$^2$D is sensitive to the verifier/drafter
+latency ratio. On small target models, cross-GPU communication and
+bookkeeping overhead can erase any benefit from asynchronous drafting. Future
+work should run the DFlash hybrid on a larger verifier--Qwen3-32B,
+Qwen3-Coder-30B-A3B, Qwen3.6-35B-A3B, or Llama-70B--using enough GPU memory
+to keep the verifier and draft paths isolated. That experiment requires more
+compute than was available for this project, but it is the appropriate test of
+whether DFlash can make S$^2$D cache misses cheap enough to improve the full
+throughput-latency frontier.
