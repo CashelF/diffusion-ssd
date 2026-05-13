@@ -5,13 +5,18 @@
   \providecommand{\doi}[1]{doi: #1}\else
   \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
 
-\bibitem[Arriola et~al.(2025)Arriola, Gokaslan, Chiu, Yang, Qi, Han, Sahoo, and Kuleshov]{arriola2025}
-Marianne Arriola, Aaron Gokaslan, Justin~T Chiu, Zhihan Yang, Zhixuan Qi, Jiaqi Han, Subham~Sekhar Sahoo, and Volodymyr Kuleshov.
-\newblock Block diffusion: Interpolating between autoregressive and diffusion language models.
+\bibitem[Arriola et~al.(2025)Arriola, Gokaslan, Chiu, Yang, Qi, Han, Sahoo, and
+  Kuleshov]{arriola2025}
+Marianne Arriola, Aaron Gokaslan, Justin~T Chiu, Zhihan Yang, Zhixuan Qi, Jiaqi
+  Han, Subham~Sekhar Sahoo, and Volodymyr Kuleshov.
+\newblock Block diffusion: Interpolating between autoregressive and diffusion
+  language models.
 \newblock In \emph{ICLR}, 2025.
 
-\bibitem[Chen et~al.(2023)Chen, Borgeaud, Irving, Lespiau, Sifre, and Jumper]{chen2023}
-Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John Jumper.
+\bibitem[Chen et~al.(2023)Chen, Borgeaud, Irving, Lespiau, Sifre, and
+  Jumper]{chen2023}
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau,
+  Laurent Sifre, and John Jumper.
 \newblock Accelerating large language model decoding with speculative sampling.
 \newblock \emph{arXiv preprint arXiv:2302.01318}, 2023.
 
@@ -19,10 +24,13 @@ Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Lauren
 Jian Chen, Yesheng Liang, and Zhijian Liu.
 \newblock {DFlash}: Block diffusion for flash speculative decoding, 2026.
 
-\bibitem[Ghazvininejad et~al.(2019)Ghazvininejad, Levy, Liu, and Zettlemoyer]{ghazvininejad2019}
+\bibitem[Ghazvininejad et~al.(2019)Ghazvininejad, Levy, Liu, and
+  Zettlemoyer]{ghazvininejad2019}
 Marjan Ghazvininejad, Omer Levy, Yinhan Liu, and Luke Zettlemoyer.
-\newblock Mask-predict: Parallel decoding of conditional masked language models.
-\newblock In \emph{Empirical Methods in Natural Language Processing (EMNLP)}, 2019.
+\newblock Mask-predict: Parallel decoding of conditional masked language
+  models.
+\newblock In \emph{Empirical Methods in Natural Language Processing (EMNLP)},
+  2019.
 
 \bibitem[Kumar et~al.(2026)Kumar, Dao, and May]{saguaro2024}
 Tanishq Kumar, Tri Dao, and Avner May.
@@ -33,18 +41,26 @@ Yaniv Leviathan, Matan Kalman, and Yossi Matias.
 \newblock Fast inference from transformers via speculative decoding.
 \newblock In \emph{International Conference on Machine Learning (ICML)}, 2023.
 
-\bibitem[Sahoo et~al.(2024)Sahoo, Arriola, Schiff, Gokaslan, Marroquin, Chiu, Rush, and Grover]{sahoo2024}
-Subham~Sekhar Sahoo, Marianne Arriola, Yair Schiff, Aaron Gokaslan, Edgar Marroquin, Justin~T Chiu, Alexander Rush, and Aditya Grover.
+\bibitem[Sahoo et~al.(2024)Sahoo, Arriola, Schiff, Gokaslan, Marroquin, Chiu,
+  Rush, and Grover]{sahoo2024}
+Subham~Sekhar Sahoo, Marianne Arriola, Yair Schiff, Aaron Gokaslan, Edgar
+  Marroquin, Justin~T Chiu, Alexander Rush, and Aditya Grover.
 \newblock Simple and effective masked diffusion language models.
 \newblock In \emph{NeurIPS}, 2024.
 
-\bibitem[Yang et~al.(2025)Yang, Li, Yang, Zhang, Hui, Zheng, Yu, Gao, Huang, Lv, Zheng, et~al.]{yang2025qwen3}
-An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, Chujie Zheng, et~al.
+\bibitem[Yang et~al.(2025)Yang, Li, Yang, Zhang, Hui, Zheng, Yu, Gao, Huang,
+  Lv, Zheng, et~al.]{yang2025qwen3}
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen
+  Yu, Chang Gao, Chengen Huang, Chenxu Lv, Chujie Zheng, et~al.
 \newblock {Qwen3} technical report, 2025.
 
-\bibitem[Zheng et~al.(2024)Zheng, Yin, Xie, Sun, Huang, Yu, Cao, Kozyrakis, Stoica, Gonzalez, Barrett, and Sheng]{zheng2024sglang}
-Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue~Livia Sun, Jeff Huang, Cody~Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph~E. Gonzalez, Clark Barrett, and Ying Sheng.
+\bibitem[Zheng et~al.(2024)Zheng, Yin, Xie, Sun, Huang, Yu, Cao, Kozyrakis,
+  Stoica, Gonzalez, Barrett, and Sheng]{zheng2024sglang}
+Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue~Livia Sun, Jeff Huang,
+  Cody~Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph~E. Gonzalez,
+  Clark Barrett, and Ying Sheng.
 \newblock {SGLang}: Efficient execution of structured language model programs.
-\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2024.
+\newblock In \emph{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2024.
 
 \end{thebibliography}

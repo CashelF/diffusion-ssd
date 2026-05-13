@@ -57,9 +57,13 @@ inference engine and measured why they do not provide useful speedups in this
 setting. Second, we implemented a DFlash hybrid in which DFlash serves
 S$^2$D speculation-cache misses using fresh verifier activations, while the
 normal AR S$^2$D drafter serves cache hits and prepares the future tree cache.
-Third, we identify the main systems bottleneck: diffusion drafting is useful
-only when the verifier is sufficiently slower than the draft path to amortize
-cross-GPU communication, scheduling, tree-cache construction, and fallback
-logic. On small verifier models, those overheads erase the advantage. Finally,
-we outline the larger-model experiment needed to decide whether DFlash+S$^2$D
-is worthwhile under representative serving conditions.
+Third, we ablate this design with a \emph{universal drafter} variant that
+also runs DFlash on cache hits, using the cached continuation as a non-mask
+prior; this lets us isolate whether re-drafting hits adds signal or simply
+costs latency. Fourth, we identify the main systems bottleneck: diffusion
+drafting is useful only when the verifier is sufficiently slower than the
+draft path to amortize cross-GPU communication, scheduling, tree-cache
+construction, and fallback logic. On small verifier models, those overheads
+erase the advantage. Finally, we outline the larger-model experiment needed
+to decide whether DFlash+S$^2$D is worthwhile under representative serving
+conditions.

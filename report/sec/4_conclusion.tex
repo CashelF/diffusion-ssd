@@ -25,6 +25,13 @@ tree work. This is not a final serving result, but it makes the bottleneck
 more specific: the hybrid is dominated by tree-cache construction and
 orchestration unless the verifier is large enough to hide those costs.
 
+On real GSM8K prompts the same two-H100 prototype reached $77.77$ tok/s with
+$\tau{=}6.79$, matching DFlash's published acceptance for Qwen3-8B
+(Table~\ref{tab:v1-v2}). A universal-drafter ablation that also runs DFlash
+on cache hits halved throughput, because non-mask priors are
+out-of-distribution for DFlash. DFlash adds value precisely where the cache
+has no answer; trusting the cache on hits is the right design.
+
 The broader conclusion is that S$^2$D is sensitive to the verifier/drafter
 latency ratio. On small target models, cross-GPU communication and
 bookkeeping overhead can erase any benefit from asynchronous drafting. Future

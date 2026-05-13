@@ -103,6 +103,19 @@ branches are returned immediately. Misses avoid the weakest fallback of
 ordinary S$^2$D, namely waiting for a full just-in-time AR draft, and instead
 use the verifier-conditioned DFlash model to provide the next block.
 
+\subsection{Universal-drafter ablation}
+\label{sec:universal-drafter}
+
+The baseline hybrid (V1) only runs DFlash on cache \emph{misses}; hits
+return the cached AR branch verbatim. As an ablation we built a
+\emph{universal drafter} variant (V2) that also invokes DFlash on hits,
+seeding its block as $[\text{recovery}, c_1, \ldots, c_{15}]$ with the
+cached tokens $c_i$ instead of the V1 form
+$[\text{recovery}, \textsc{mask}, \ldots]$. The same target-conditioned
+DFlash forward is used; on a miss V2 is identical to V1. V2 additionally
+advances the DFlash per-sequence KV cache and activation backlog on hits
+(which V1 leaves untouched).
+
 \subsection{Correctness and v1 restrictions}
 
 Both block diffusion and DFlash are still draft mechanisms: the target

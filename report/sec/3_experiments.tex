@@ -175,6 +175,43 @@ length is not always beneficial: beyond the point where additional drafted
 positions are rarely accepted, the larger SSD tree can cost more than it
 saves.
 
+\paragraph{V1 vs V2 on real GSM8K prompts.}
+Re-running the prototype on real GSM8K chat-templated prompts ($8$ prompts,
+$128$ output tokens, greedy, $k{=}15$) on the same two-H100 Modal
+configuration removes the random-token confound and lets us compare V1
+against V2 (Sec.~\ref{sec:universal-drafter}).
+
+\begin{table}[t]
+  \caption{V1 (DFlash on misses only) vs V2 (DFlash on hits and misses) on
+  Qwen3-8B with Qwen3-0.6B + \texttt{Qwen3-8B-DFlash-b16}. GSM8K,
+  $8{\times}128$, greedy, two H100. $\tau$ is mean accepted-suffix length.}
+  \label{tab:v1-v2}
+  \centering
+  \scriptsize
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}lrr@{}}
+    \toprule
+    Metric & V1 & V2 \\
+    \midrule
+    Throughput (tok/s)        & \textbf{77.77} & 31.33 \\
+    $\tau$ overall            & \textbf{6.79}  & 2.10 \\
+    $\tau$ on cache hit / miss & 7.36 / 4.04   & 1.97 / 4.37 \\
+    Cache hit rate            & 0.83           & 0.95 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+V1's $\tau{=}6.79$ matches DFlash's published $\tau{=}6.54$ on the same
+target+dataset (Table~\ref{tab:dflash-reference}), confirming the
+integration is correct; V1's $77.77$ tok/s is $\sim 2.5\times$ over plain
+AR Qwen3-8B on H100. V2 collapses hit-path acceptance from $7.36$ to $1.97$
+while leaving miss-path acceptance unchanged: DFlash is trained on
+$[\text{anchor}, \textsc{mask}, \ldots]$ blocks, so cached tokens as a
+non-mask prior are out-of-distribution input. Since $95\%$ of steps hit,
+the broken hit response halves throughput. The V1 design choice of
+trusting the cache on hits is therefore the right one; making V2 viable
+would need DFlash retrained on partial-mask blocks.
+
 \paragraph{Small verifiers are the wrong stress test.}
 S$^2$D benefits when the target verifier is much slower than the draft path.
 If the verifier is small, the latency gap between verifier and drafter shrinks
