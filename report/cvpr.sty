@@ -37,11 +37,7 @@
 \RequirePackage[numbers,sort&compress]{natbib}
 \setlength{\bibsep}{1pt plus 1pt minus 1pt}
 
-\RequirePackage{silence}  % Suppress unwanted warnings
 \hbadness=10000 \vbadness=10000 \vfuzz=30pt \hfuzz=30pt
-\WarningFilter{latexfont}{Font shape declaration}
-\WarningFilter{latex}{Font shape}
-\WarningFilter[rebuttal]{latex}{No \author given}
 \RequirePackage{etoolbox}
 
 % Use modern caption package to allow for sub-figures etc.
@@ -502,7 +498,5 @@
 
 % ---------------------------------------------------------------
 
-%% More compact compact itemize/enumeration (e.g. list contributions)
-\RequirePackage[shortlabels,inline]{enumitem}
-\setlist[itemize]{noitemsep,leftmargin=*,topsep=0em}
-\setlist[enumerate]{noitemsep,leftmargin=*,topsep=0em}
+%% Compact list customization is disabled here to avoid depending on
+%% enumitem in minimal TeX installations.

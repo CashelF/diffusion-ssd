@@ -1,4 +1,27 @@
 \begin{abstract}
 \normalfont
-Autoregressive (AR) decoding bottlenecks large language model (LLM) inference: each token requires a sequential forward pass through the target model. Speculative decoding (SD) accelerates this by using a small AR draft model to propose tokens that the target verifies in parallel, and Speculative$^2$ Decoding (S$^2$D) further removes idle time by having the draft model anticipate verification outcomes and pre-generate continuations. Both approaches, however, still draft tokens \emph{one at a time}. We replace the AR draft with a \emph{discrete diffusion} language model that fills an entire block of $k$ tokens in a small constant number of parallel refinement steps, and integrate it with S$^2$D so that draft generation, draft verification, and lookahead speculation overlap. We implement two diffusion drafters: a masked diffusion language model (MDLM) with mask-predict / remask samplers and full attention, and a block-diffusion model (BD3LM) with staircase attention, prefix-cache reuse, and a first-hitting sampler. We also add a switching scheme that warm-starts with an AR drafter before handing off to diffusion. We benchmark against AR, sync SD, and async S$^2$D baselines on HumanEval, Alpaca, GSM8K, and UltraFeedback. We report wall-clock throughput, target-step acceptance length, and qualitative samples to confirm that distributional fidelity is preserved.
+Speculative decoding accelerates autoregressive language model inference by
+letting a cheap draft model propose multiple future tokens that a target model
+verifies in parallel. Speculative$^2$ Decoding (S$^2$D) goes further: while
+the target verifies one draft, a separate draft device precomputes
+continuations for likely verification outcomes. This naturally invites a
+diffusion drafter, since a block-diffusion model can in principle generate an
+entire draft block in parallel. We study that idea in two forms. First, we
+integrate conventional masked and block-diffusion language models into the
+S$^2$D draft interface. This negative result is the main lesson: practical
+block diffusion still requires many refinement forwards, often approaching
+the number of tokens in the block, so the drafter becomes the bottleneck. Our
+best traditional block-diffusion runs reached only about $20$ tokens/s.
+Second, we prototype a DFlash-style hybrid that uses target activations from
+the verifier to produce a first draft block on S$^2$D cache misses, while the
+normal autoregressive S$^2$D drafter serves cache hits and fills the future
+speculation cache. This is architecturally more promising because DFlash
+drafts a block in a single conditioned pass, but our current small-model
+prototype remains limited by systems overhead: on Qwen3-8B with a Qwen3-0.6B
+S$^2$D drafter and \texttt{Qwen3-8B-DFlash-b16}, we measured $11.68$
+tokens/s, average accepted length $3.30$, cache hit rate $0.60$, DFlash seed
+latency $34.48$ ms, and SSD tree-decode latency about $79$ ms. We conclude
+that diffusion drafters are only useful for S$^2$D when draft latency is far
+below target verification latency, and that representative evaluation requires
+a larger verifier and less resource-constrained hardware.
 \end{abstract}

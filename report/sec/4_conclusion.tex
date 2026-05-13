@@ -1,18 +1,29 @@
 \section{Conclusion}
 \label{sec:conclusion}
 
-We built a drop-in \emph{diffusion} draft backend for a Speculative$^2$
-Decoding engine. The drafter generates $k$ tokens in $R \ll k$ parallel
-refinement steps using a masked or block-diffusion model, and hands the
-block to the existing S$^2$D verifier unchanged, so samples remain
-exactly distributed according to the target. We support MDLM-style
-full attention and BD3LM-style staircase attention with prefix-KV reuse,
-three samplers (mask-predict, remask, first-hitting), and an AR
-warm-start.
+We investigated whether diffusion drafters are a good fit for
+Speculative$^2$ Decoding. The direct approach--replacing the AR drafter with a
+traditional masked or block-diffusion model--did not work well. Although block
+diffusion predicts many positions per forward pass, practical generation still
+requires many refinement passes. In our system this made the diffusion
+drafter, not the verifier, the bottleneck, with throughput around $20$
+tokens/s.
 
-The key takeaway is that \emph{parallel block drafting only beats AR
-drafting when the per-step cost of the diffusion model is amortised
-over a long enough drafted block.} Staircase attention with prefix-KV
-caching is what makes this work: it turns the constant $R$-step
-overhead into a small fraction of the drafting cost, after which the
-diffusion drafter integrates cleanly into S$^2$D.
+DFlash is a better match to the problem because it uses target activations
+from the verifier and drafts a full block in one conditioned pass. We
+implemented a DFlash-seeded S$^2$D hybrid in which DFlash serves
+speculation-cache misses and the normal AR S$^2$D drafter serves cache hits
+and prepares the future tree cache. This preserves exact verification and
+keeps the fast S$^2$D hit path intact. Our current Qwen3-8B prototype is not
+yet fast, reaching $11.68$ tokens/s with $34.48$ ms DFlash seed latency and
+$79$ ms SSD tree-decode latency, but it isolates the right next bottlenecks.
+
+The broader conclusion is that S$^2$D is sensitive to the verifier/drafter
+latency ratio. On small target models, cross-GPU communication and
+bookkeeping overhead can erase any benefit from asynchronous drafting. Future
+work should run the DFlash hybrid on a larger verifier--Qwen3-32B,
+Qwen3-Coder-30B-A3B, Qwen3.6-35B-A3B, or Llama-70B--using enough GPU memory
+to keep the verifier and draft paths isolated. That experiment requires more
+compute than was available for this project, but it is the appropriate test of
+whether DFlash can make S$^2$D cache misses cheap enough to improve the full
+throughput-latency frontier.

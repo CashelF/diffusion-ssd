@@ -4,126 +4,107 @@
 \subsection{Background}
 
 \paragraph{Speculative decoding.}
-At each iteration, $M_d$ samples a length-$k$ continuation
-$\hat{x}_{t+1:t+k} \sim \prod_{i=1}^{k} q(x_{t+i} \mid x_{\le t+i-1})$
-from prefix $x_{\le t}$. $M_t$ then computes
-$p(x_{t+i} \mid x_{\le t+i-1})$ for $i = 1,\dots,k+1$ in a single
-forward pass over $k+1$ positions. Each drafted token is accepted with
-probability $\min(1, p/q)$, the first rejection is resampled from the
-residual distribution, and decoding resumes. Samples are exactly
-distributed according to $p$~\cite{leviathan2023, chen2023}.
+Given prefix $x_{\le t}$, a draft model $M_d$ proposes
+$\hat{x}_{t+1:t+k}$ autoregressively. The target model $M_t$ then evaluates
+the drafted positions in one forward pass and accepts each token according to
+the standard rejection-sampling rule
+$\min(1, p_{M_t}(\hat{x}_i)/p_{M_d}(\hat{x}_i))$~\cite{leviathan2023,
+chen2023}. At the first rejection, SD samples a corrected token from the
+residual distribution. Under this rule, SD changes latency but not the output
+distribution.
 
 \paragraph{Speculative$^2$ decoding.}
-S$^2$D~\cite{saguaro2024} observes that in vanilla SD, $M_d$ sits idle
-while $M_t$ verifies. Instead, while $M_t$ verifies block $b$, $M_d$
-\emph{simultaneously} predicts what the verifier is likely to accept
-and drafts continuations for each of the $f$ most probable verification
-outcomes. If the verifier's outcome lies in this tree (common at high
-acceptance rate), the next draft block is already prepared; otherwise
-the engine falls back to a recovery draft.
+S$^2$D keeps the target and draft on separate devices~\cite{saguaro2024}.
+While the target verifies the current speculation, the draft predicts likely
+verification outcomes $(a, r)$, where $a$ is the number of accepted draft
+tokens and $r$ is the recovery or bonus token. It then precomputes
+continuations for those outcomes and stores them in a speculation cache. A
+cache hit eliminates the next drafting wait; a cache miss falls back to a
+synchronous or just-in-time draft.
 
 \paragraph{Discrete diffusion drafters.}
-MDLM~\cite{sahoo2024} parameterizes $p_\theta(x_0 \mid x_t)$ where
-$x_t$ is partially masked. At inference time we start from a fully
-masked block and iteratively unmask high-confidence positions over $R$
-refinement steps, with $R \ll k$. BD3LM~\cite{arriola2025} additionally
-imposes a \emph{block-causal} attention structure (the staircase
-pattern): positions in block $b$ may attend to earlier blocks plus
-positions inside block $b$, but not to future blocks.
+Masked diffusion language models iteratively replace mask tokens with
+predictions~\cite{sahoo2024}. Block diffusion adds a block-causal attention
+pattern, often called staircase attention, so that a sequence is generated
+block by block while positions inside the current block are denoised in
+parallel~\cite{arriola2025}. These models are bidirectional inside the open
+block, so only fully committed prefix blocks are safe to reuse in a KV cache;
+the partially filled open block must be recomputed with accepted tokens
+clamped and unresolved positions masked.
 
-\subsection{Diffusion drafting inside S$^2$D}
+\subsection{Traditional block diffusion in \texorpdfstring{S$^2$D}{S2D}}
 
-We add a \texttt{block} draft backend
-(\texttt{BlockDiffusionDraftBackend} in
-\texttt{ssd/engine/draft\_backends.py}) that replaces the AR drafter in the
-S$^2$D loop. For a batch of sequences with prefixes
-$\{x^{(b)}_{\le t_b}\}_{b=1}^{B}$ and a requested lookahead $k$, the
-backend executes the following:
+Our first integration adds a \texttt{block} draft backend with three samplers:
+mask-predict~\cite{ghazvininejad2019}, remask, and first-hitting. Given a
+prefix and lookahead $k$, the backend constructs
+\[
+  [x_{\le t}, \underbrace{\textsc{mask},\ldots,\textsc{mask}}_{k}]
+\]
+and runs $R$ refinement forwards. Each forward predicts logits for all masked
+positions, commits a subset of tokens according to the sampler, and reuses or
+recomputes the open block as required by the attention pattern. We implemented
+both full bidirectional attention and staircase attention with prefix-cache
+reuse for committed blocks.
+
+This is the most direct diffusion replacement for an AR drafter, but it is
+not the right systems trade-off. In practice, useful drafts require multiple
+diffusion forwards. The draft cost is therefore not one block pass; it is
+approximately
+\[
+  T_{\mathrm{draft}} \approx R \cdot T_{\mathrm{diffusion\_forward}},
+\]
+plus cache construction and transfer overhead. When $R$ becomes large enough
+to produce acceptable tokens, this can approach the cost of generating the
+block token-by-token with a small AR drafter. Since S$^2$D only helps if the
+draft path can be hidden under target verification, this iterative diffusion
+cost becomes a bottleneck.
+
+\subsection{DFlash-seeded \texorpdfstring{S$^2$D}{S2D}}
+
+DFlash addresses the quality-latency problem by conditioning a lightweight
+block-diffusion drafter on target hidden states~\cite{chen2026dflash}. The
+target verifier already computes rich activations during prefill and verify;
+DFlash concatenates selected target-layer residual streams, injects those
+features into the draft model's KV cache, and predicts the next block from a
+recovery token followed by mask tokens. The DFlash checkpoint we target,
+\texttt{z-lab/Qwen3-8B-DFlash-b16}, has block size $16$, so our v1 path uses
+$k=15$ speculative draft tokens.
+
+We integrate DFlash with S$^2$D as a miss handler rather than replacing the
+whole S$^2$D loop. The hybrid works as follows.
 
 \begin{enumerate}
-  \item \textbf{Prepare input.} For each sequence, allocate a buffer of
-        length $t_b + k$, fill the prefix region with $x^{(b)}_{\le t_b}$,
-        and the next $k$ positions with the mask token
-        $\mathsf{m}$. Pad the batch to a common length.
-  \item \textbf{Refine for $R$ steps.} At each step
-        $r = 0, \dots, R-1$, run a forward pass of the diffusion model,
-        extract the $k$ block logits, project them onto the target
-        vocabulary, and run the configured sampler (Sec.~\ref{sec:samplers})
-        to update the block.
-  \item \textbf{Emit draft.} After step $R-1$, the block contains the
-        proposed draft tokens. We return both the tokens and the final
-        block logits, which S$^2$D uses for the speculation tree.
+  \item The verifier runs the target model and returns logits, recovery
+        tokens, and DFlash target activations.
+  \item The async draft process receives a speculation-cache request keyed by
+        the sequence id, accepted depth, and recovery token.
+  \item On a cache hit, S$^2$D returns the normal cached AR-draft branch.
+  \item On a cache miss, DFlash receives the verifier activation backlog,
+        builds $[\text{recovery}, \textsc{mask}^{15}]$, and produces a
+        15-token draft block using the target embedding and LM head.
+  \item After the exact verifier accepts or rejects the proposed block, the
+        scheduler appends only the verified target activations to the DFlash
+        backlog and crops the DFlash cache back to the verified prefix.
+  \item In parallel, the existing S$^2$D AR drafter continues constructing the
+        tree cache for future likely verification outcomes.
 \end{enumerate}
 
-The verifier then proceeds exactly as in standard S$^2$D, treating the
-diffusion-generated block like any other length-$k$ draft. Acceptance is
-performed token-by-token along the block, so distributional correctness
-relative to $M_t$ is inherited from the underlying SD rejection rule.
+The important design choice is that DFlash is used only when the S$^2$D tree
+cache misses. Hits keep the original S$^2$D fast path, where precomputed AR
+branches are returned immediately. Misses avoid the weakest fallback of
+ordinary S$^2$D, namely waiting for a full just-in-time AR draft, and instead
+use the verifier-conditioned DFlash model to provide the next block.
 
-\subsection{Samplers and attention modes}
-\label{sec:samplers}
+\subsection{Correctness and v1 restrictions}
 
-We implement three samplers that govern \emph{which} masked positions get
-committed at each refinement step. Let
-$\pi_i = \mathrm{softmax}(\mathrm{logits}_i)$ and
-$\hat{x}_i = \arg\max_v \pi_{i,v}$ be the per-position argmax, with
-confidence $c_i = \max_v \pi_{i,v}$.
+Both block diffusion and DFlash are still draft mechanisms: the target
+verifier remains exact. At greedy temperature zero, matching AR outputs
+token-for-token is the correctness test. For stochastic decoding, the same SD
+residual rule would preserve the target distribution, but our implementation
+currently focuses on greedy decoding to isolate systems behavior.
 
-\begin{itemize}
-  \item \textbf{Mask-predict.} At step $r$, lock the
-        $\lceil k \cdot (r+1)/R \rceil$ highest-confidence positions to
-        $\hat{x}_i$; re-mask the rest. Variant of~\cite{ghazvininejad2019}.
-  \item \textbf{Remask.} Commit all argmax tokens, then re-mask the
-        $k - \lceil k(r+1)/R\rceil$ \emph{least} confident positions. This
-        is the original MDLM-style sampler.
-  \item \textbf{First-hitting.} Compatible only with staircase attention.
-        At step $r$, commit a fixed schedule of $s_r$ tokens chosen by
-        confidence and never re-mask them. This matches the BD3LM
-        decoding rule.
-\end{itemize}
-
-Attention is one of \texttt{full} (bidirectional within the whole sequence,
-as in MDLM) or \texttt{staircase} (block-causal, as in BD3LM). When the
-staircase pattern is used and the prefix is stable across draft calls, we
-optionally maintain a per-sequence prefix KV cache (\texttt{block\_prefix\_cache})
-keyed by the longest common prefix of consecutive calls, so that only the
-masked block is forwarded through the model each refinement step.
-
-\subsection{AR warm-start and switching}
-
-Diffusion drafters are most useful once the prefix is long enough to
-give the block model meaningful conditioning context; early in a
-generation the prefix is short and the diffusion drafter under-performs
-a tiny AR drafter. We therefore wrap two backends in a
-\texttt{SwitchingDraftBackend}: an AR drafter handles the first $N$
-completion tokens, after which the block-diffusion drafter takes over.
-On single-GPU servers the inactive backend is paged out by default;
-\texttt{--block-warm-start-keep-loaded} keeps both resident on
-multi-GPU machines where memory is not the binding constraint.
-
-The pipeline is implemented in a custom inference engine that also
-supports tensor parallelism, PagedAttention, CUDA graphs,
-\texttt{torch.compile}, and target-side prefix caching. Sync SD and
-async S$^2$D share the same draft backend interface, so the diffusion
-drafter slots in unchanged; the block backend is currently restricted
-to sync SD, with async support a natural next step. Code lives in
-\texttt{ssd/engine/draft\_backends.py} and is exposed by
-\texttt{bench.py} via \texttt{--draft-backend block}.
-
-\begin{figure*}[t]
-  \centering
-  \includegraphics[width=0.95\linewidth]{overview.png}
-  \caption{
-    \textbf{Left:} standard speculative decoding alternates draft and
-    verify on the same hardware, so the draft model is idle during
-    verification. \textbf{Middle:} S$^2$D runs draft and verify in
-    parallel by speculating against multiple predicted verification
-    outcomes; on a hit (green leaf) the next block is already in hand.
-    \textbf{Right:} this work replaces the AR drafter inside the S$^2$D
-    loop with a discrete diffusion drafter that fills an entire block in
-    $R$ parallel refinement steps. The bar chart shows headline tokens/s
-    on \texttt{Llama-3.3 70B} with AR, SD, and S$^2$D drafts; the empty
-    slot for ``diffusion-S$^2$D'' is the target of this work.
-  }
-  \label{fig:overview}
-\end{figure*}
+The current DFlash+S$^2$D prototype intentionally supports only batch size
+$1$, two GPUs, Qwen3-style target activations, and greedy decoding. The
+verifier and drafter are placed on separate visible GPUs. This is sufficient
+to test the central systems question: can a one-pass target-conditioned
+diffusion block drafter make S$^2$D cache misses cheaper than AR fallback?

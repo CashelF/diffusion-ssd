@@ -3,157 +3,161 @@
 
 \subsection{Setup}
 
-\paragraph{Hardware.} All experiments run on NVIDIA H100 80GB GPUs. We
-report numbers for the configurations \texttt{4$\times$H100} (Llama
-70B target on 4 GPUs, draft on the same set for sync SD or on a 5th GPU
-for async S$^2$D) and \texttt{1$\times$H100} (Qwen3 1.7B target with
-small draft, used for ablations).
+\paragraph{Reference SSD evaluation.}
+The original S$^2$D paper evaluates batch-size-one greedy decoding with the
+target on $4\times$H100 and, for SSD, the asynchronous draft on a separate
+H100~\cite{saguaro2024}. Its Llama setup uses Llama-3.1-70B-Instruct with a
+Llama-3.2-1B draft model; the Qwen appendix uses Qwen3-32B with a Qwen3-0.6B
+draft model~\cite{yang2025qwen3}. The benchmark pool contains $128$ prompts
+from each of HumanEval, Alpaca, GSM8K, and UltraFeedback, for $512$ prompts
+total, with $512$ output tokens per prompt.
 
-\paragraph{Models.} The autoregressive baselines pair a target
-$M_t \in \{\texttt{Llama-3.3-70B-Instruct},\texttt{Qwen3-1.7B}\}$ with an
-AR drafter $M_d^{\textsc{ar}} \in
-\{\texttt{Llama-3.2-1B-Instruct},\texttt{Qwen3-0.6B}\}$. The diffusion
-drafters are an MDLM~\cite{sahoo2024} checkpoint with full bidirectional
-attention and a BD3LM~\cite{arriola2025} checkpoint with block-causal
-attention; both are tokenized into the target's vocabulary so that
-verification needs no remapping.
+\paragraph{Our local evaluation.}
+Our diffusion experiments were constrained by available compute. We used
+shared A6000-class machines for implementation and smoke testing, and several
+larger runs were blocked by other processes occupying most GPU memory. The
+reported prototype numbers should therefore be read as diagnostic
+measurements, not as final throughput claims. This limitation matters:
+S$^2$D is a latency-hiding method, so evaluating it on a small verifier or on
+busy GPUs can make communication and scheduler overhead look much worse than
+it would with a larger target.
 
-\paragraph{Datasets.} We evaluate on four datasets, each chosen because
-the speedup of speculative methods depends strongly on how predictable
-the data is:
-\begin{itemize}
-  \item \textbf{HumanEval}~\cite{chen2021humaneval}: Python code, very
-        predictable; expected to give the highest acceptance rates.
-  \item \textbf{Alpaca}~\cite{taori2023alpaca}: instruction-following
-        prompts with short generations.
-  \item \textbf{GSM8K}~\cite{cobbe2021gsm8k}: grade-school math word
-        problems with chain-of-thought completions.
-  \item \textbf{UltraFeedback}~\cite{cui2023ultrafeedback}: open-ended
-        dialogue, generally the hardest setting for SD.
-\end{itemize}
-Each dataset contributes $128$ prompts to the evaluation pool, for $512$
-prompts total under \texttt{--all}. We generate up to $512$ output tokens
-per prompt and use greedy decoding ($T = 0$) throughout, which is the
-regime in which exactness of SD/S$^2$D is most easily verified.
+\paragraph{Models.}
+For the traditional block-diffusion path, we used the small Qwen-family stack
+available in the repository and the block/MDLM-style draft checkpoints
+supported by our backend. For the DFlash hybrid, we used Qwen3-8B as the
+target, Qwen3-0.6B as the normal S$^2$D AR drafter, and
+\texttt{z-lab/Qwen3-8B-DFlash-b16} as the target-conditioned DFlash drafter.
+The DFlash checkpoint has block size $16$, so all DFlash runs use $k=15$.
 
-\paragraph{Metrics.} We track:
-\begin{enumerate}
-  \item \textbf{End-to-end throughput (tokens/s).} Wall-clock token
-        throughput, averaged over the full prompt pool. This is the
-        metric a user actually feels, and the only one that captures the
-        full pipeline (drafting, verification, scheduling, KV cache, and
-        any speculation overhead).
-  \item \textbf{Accepted suffix length per verify step.} How many draft
-        tokens, on average, survive a single target forward pass. This
-        isolates the quality of the drafter from the rest of the engine
-        and is the right metric for comparing drafting strategies in
-        isolation. We report both the on-hit value (acceptance length
-        conditional on a hit) and the recovery-adjusted value (acceptance
-        length including miss recovery).
-  \item \textbf{Target step time (ms).} A sanity check that the
-        diffusion drafter is not slowing down the target's verify path.
-  \item \textbf{Output equivalence.} At $T=0$, all SD-family methods
-        should produce \emph{exactly} the same tokens as plain AR
-        decoding. We hash and compare completions across methods to
-        verify this; any divergence is a correctness bug, not a
-        quality--speed trade-off.
-\end{enumerate}
-Throughput is the headline metric because it is what the rest of the
-serving stack pays for; acceptance length is the headline diagnostic
-because it cleanly attributes wins or losses to the drafter.
+\paragraph{Metrics.}
+We report end-to-end generated-token throughput, average accepted length per
+verify step, S$^2$D cache hit rate, DFlash seed latency, and SSD tree-decode
+latency. Throughput is the user-visible metric. Acceptance and cache hit rate
+diagnose draft quality and S$^2$D prediction quality. Seed and tree-decode
+latencies identify whether the bottleneck is DFlash, the AR tree cache, or
+cross-process orchestration.
 
-\paragraph{Baselines.} We compare against (i) AR decoding on the target
-alone, (ii) sync SD with an AR draft, (iii) async SD (S$^2$D) with an AR
-draft, and (iv) external baselines from \texttt{vLLM 0.16.0} and
-\texttt{SGLang 0.5.9} in both AR and SD modes. Our system corresponds to
-sync SD or async S$^2$D with the block draft backend swapped in.
+\subsection{Reference numbers from SSD and DFlash}
 
-\subsection{Quantitative results}
-
-Tab.~\ref{tab:throughput-70b} compares end-to-end throughput on
-\texttt{Llama-3.3 70B} with a $1$B AR draft or our diffusion drafter, at
-batch size $1$. Numbers in the AR / SD / S$^2$D rows are the canonical
-points already reported in the engine README. Tab.~\ref{tab:throughput-qwen}
-shows the same comparison on the smaller Qwen3 stack, where we sweep
-$k \in \{6,10,15\}$ and refinement steps $R \in \{2,4\}$.
+Table~\ref{tab:ssd-reference} summarizes the published S$^2$D numbers most
+relevant to this project. The Qwen3-32B results are especially important: they
+show that S$^2$D still improves over ordinary SD, but the speedup over AR is
+smaller than in the Llama-70B setting because the verifier is faster and the
+draft/communication overheads are less easily amortized.
 
 \begin{table}[t]
-  \caption{End-to-end throughput on \texttt{Llama-3.3 70B}, averaged over
-  $4{\times}128 = 512$ prompts (HumanEval, Alpaca, GSM8K, UltraFeedback).
-  Greedy, $512$ output tokens, batch $1$, $4{\times}$H100; S$^2$D uses a
-  $5^{\text{th}}$ H100 for the draft. Speedups vs.\ AR baseline.}
-  \label{tab:throughput-70b}
+  \caption{Published S$^2$D results from Kumar et al.~\cite{saguaro2024}.
+  Values are end-to-end decode throughput in tokens/s averaged over four
+  datasets.}
+  \label{tab:ssd-reference}
   \centering
   \footnotesize
-  \begin{tabular}{@{}llrr@{}}
+  \begin{tabular}{@{}lrrrr@{}}
     \toprule
-    Method & Draft & tok/s & Speedup \\
+    Model pair & AR & SD & SSD & SSD/AR \\
     \midrule
-    AR (vLLM)             & --     & 65  & $1.0\times$ \\
-    AR (SGLang)           & --     & 65  & $1.0\times$ \\
-    SD (vLLM, $k{=}4$)    & 1B AR  & 110 & $1.7\times$ \\
-    SD (SGLang, $k{=}4$)  & 1B AR  & 170 & $2.6\times$ \\
-    S$^2$D, AR draft      & 1B AR  & 260 & $4.0\times$ \\
-    \midrule
-    Sync SD, diff. draft  & MDLM   & \todo{?} & \todo{?} \\
-    Sync SD, diff. draft  & BD3LM  & \todo{?} & \todo{?} \\
-    S$^2$D, diff. draft   & MDLM   & \todo{?} & \todo{?} \\
-    S$^2$D, diff. draft   & BD3LM  & \todo{?} & \todo{?} \\
+    Llama 70B / 1B & 54.7 & 161.8 & 255.8 & $4.68\times$ \\
+    Qwen3 32B / 0.6B & 88.8 & 136.8 & 203.8 & $2.29\times$ \\
     \bottomrule
   \end{tabular}
 \end{table}
 
+Table~\ref{tab:dflash-reference} gives the DFlash reference point. DFlash is
+not merely a generic block-diffusion model; it uses target activations and
+generates the whole block in one conditioned draft pass. Published SGLang
+results on a single B200 show large Qwen3-8B speedups, which is why DFlash is
+a more promising diffusion substrate for S$^2$D than iterative block
+diffusion.
+
 \begin{table}[t]
-  \caption{Mean accepted suffix length per verify step (tokens) by
-  dataset. Target \texttt{Qwen3-1.7B}; AR drafter is
-  \texttt{Qwen3-0.6B}; block-diffusion drafter is BD3LM with staircase
-  attention, first-hitting sampler, prefix-KV cache, $R=4$. Higher is
-  better.}
-  \label{tab:throughput-qwen}
+  \caption{Published DFlash SGLang throughput for Qwen3-8B on a single B200
+  with FlashAttention-4~\cite{chen2026dflash}.}
+  \label{tab:dflash-reference}
   \centering
   \footnotesize
-  \setlength{\tabcolsep}{3pt}
-  \begin{tabular}{@{}lcccc@{}}
+  \begin{tabular}{@{}lrrrr@{}}
     \toprule
-    Drafter & HEval & Alpaca & GSM8K & UltraFB \\
+    Task & AR & DFlash & Speedup & Avg. $\tau$ \\
     \midrule
-    AR ($k{=}6$)       & \todo{?} & \todo{?} & \todo{?} & \todo{?} \\
-    BD3LM ($k{=}15$)   & \todo{?} & \todo{?} & \todo{?} & \todo{?} \\
-    BD3LM, warm-start  & \todo{?} & \todo{?} & \todo{?} & \todo{?} \\
+    Math500 & 230 & 1175 & $5.1\times$ & 8.01 \\
+    HumanEval & 229 & 955 & $4.2\times$ & 6.50 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\paragraph{Ablations.} We additionally ablate (a) the sampler
-(\texttt{mask\_predict} vs.\ \texttt{remask} vs.\ \texttt{first\_hitting}),
-(b) the number of refinement steps $R$, (c) the attention mode
-(\texttt{full} vs.\ \texttt{staircase}, the latter with prefix caching),
-and (d) the warm-start length $N$. The pattern we observe is:
-staircase attention with prefix-KV reuse is the single most important
-knob: without it, the per-step cost of the draft model wipes out the
-gain from parallel block generation. \texttt{first\_hitting} is the
-sampler that pairs best with it. \texttt{mask\_predict} is a close
-runner-up; \texttt{remask} is consistently worse because committing
-all positions every step destabilises the trajectory. (\TODO{Insert exact
-numbers from the WandB sweep.})
+\subsection{Our findings}
 
-\subsection{Qualitative results and discussion}
+\paragraph{Traditional block diffusion is too slow for SSD.}
+The direct block-diffusion integration did not produce useful S$^2$D speedups.
+The reason is mechanical: although a diffusion forward predicts all block
+positions in parallel, the sampler must run many refinement forwards to get
+acceptable token quality. In the settings where generations were coherent
+enough to verify well, the number of diffusion passes was close to the number
+of useful block tokens. The result was a draft-side bottleneck rather than a
+hidden draft cost. Our best traditional block-diffusion throughput was only
+about $20$ tokens/s, far below the AR and SSD reference points in
+Table~\ref{tab:ssd-reference}.
 
-To confirm distributional fidelity, we sample $10$ HumanEval prompts at
-$T=0$ and check that the diffusion-S$^2$D completions match the AR
-completions token-for-token. They do, which is the expected behaviour
-under SD rejection sampling and confirms the drafter does not bias the
-verifier. At $T>0$ the outputs are distributionally equivalent rather
-than identical; a large-scale $T>0$ quality study is left to future
-work.
+\paragraph{DFlash improves the diffusion primitive but not yet the full hybrid.}
+The DFlash path removes the main flaw above: it uses fresh target activations
+and proposes the block in one draft call. Our current hybrid, however, is not
+yet competitive end to end. On the Qwen3-8B/Qwen3-0.6B/DFlash-b16 prototype,
+a 32-token smoke run measured:
 
-The main practical lesson is that diffusion drafting only pays off when
-the per-step cost of the diffusion forward pass is amortised across
-many drafted tokens. Two design choices matter most: (i) the
-\texttt{staircase} attention layout, because it lets us cache the
-prefix KV state and only re-run the masked block at each refinement
-step; and (ii) a long enough lookahead $k$, because the $R$-step
-refinement overhead is fixed while accepted tokens scale with $k$ when
-the data is predictable. Without either of them, the AR drafter
-remains the better default, which is consistent with what we observe
-when the warm-start length $N$ is set to zero.
+\begin{table}[t]
+  \caption{Current DFlash+S$^2$D prototype diagnostics. This run used Qwen3-8B
+  target, Qwen3-0.6B AR drafter, and \texttt{Qwen3-8B-DFlash-b16}; it was a
+  small diagnostic run, not the full 512-prompt evaluation.}
+  \label{tab:prototype}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}lr@{}}
+    \toprule
+    Metric & Value \\
+    \midrule
+    Throughput & 11.68 tok/s \\
+    Average accepted length & 3.30 tokens \\
+    S$^2$D cache hit rate & 0.60 \\
+    DFlash seed latency & 34.48 ms \\
+    SSD tree-decode latency & 79 ms \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+These numbers should not be interpreted as evidence that DFlash is slow.
+Rather, they show that our first hybrid pays too much systems overhead for the
+small verifier used in the test. The DFlash seed itself is tens of
+milliseconds, while the SSD tree-decode path is even larger. With an 8B
+verifier on busy A6000s, target verification is not slow enough for the
+separate-GPU draft path, tensor transfers, cache bookkeeping, and tree
+construction to be hidden.
+
+\paragraph{Small verifiers are the wrong stress test.}
+S$^2$D benefits when the target verifier is much slower than the draft path.
+If the verifier is small, the latency gap between verifier and drafter shrinks
+and fixed costs dominate: inter-GPU tensor transfers, process synchronization,
+PyTorch dispatch, CUDA graph warmup, cache-key matching, and tree-cache
+population. This explains why the Qwen3-32B SSD speedup reported by
+Kumar et al.~\cite{saguaro2024} is lower than the Llama-70B speedup, and why
+our Qwen3-8B prototype is an especially unfavorable testbed.
+
+\paragraph{Compute limited the representative test.}
+The decisive experiment is DFlash+S$^2$D on a larger verifier, such as
+Qwen3-32B, Qwen3-Coder-30B-A3B, Qwen3.6-35B-A3B, or Llama-70B, with the
+DFlash and AR draft paths isolated on a separate GPU. We were not able to run
+that full experiment within the available GPU credits and shared-server
+availability. This is a practical limitation, not just an engineering
+inconvenience: the hypothesis specifically concerns latency hiding at large
+target-model scale, and small smoke runs cannot validate it.
+
+\subsection{Discussion}
+
+The negative result is still useful. A generic block-diffusion model is not a
+drop-in win for S$^2$D because iterative denoising is too expensive. DFlash is
+the more plausible route because it collapses block drafting to one
+target-conditioned pass and achieves high acceptance in published serving
+experiments. Our hybrid design also preserves the strongest part of S$^2$D:
+cache hits still return precomputed AR branches immediately. The open question
+is whether DFlash can make misses cheap enough on a verifier large enough that
+the target pass dominates all other overhead.
