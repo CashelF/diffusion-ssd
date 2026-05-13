@@ -68,7 +68,13 @@ DFlash concatenates selected target-layer residual streams, injects those
 features into the draft model's KV cache, and predicts the next block from a
 recovery token followed by mask tokens. The DFlash checkpoint we target,
 \texttt{z-lab/Qwen3-8B-DFlash-b16}, has block size $16$, so our v1 path uses
-$k=15$ speculative draft tokens.
+$15$ native DFlash draft tokens. For synchronous DFlash, this fixes the
+speculation lookahead at $k=15$. For the DFlash+S$^2$D hybrid, however, we
+separate the DFlash lookahead from the SSD lookahead. Cache misses always ask
+DFlash for the full 15-token block required by the checkpoint, while the SSD
+response may expose only the first $k_{\mathrm{SSD}}$ tokens and logits to the
+verifier. This keeps the DFlash checkpoint geometry unchanged while allowing
+the SSD tree depth, fan-out buffers, and tree-cache work to shrink.
 
 We integrate DFlash with S$^2$D as a miss handler rather than replacing the
 whole S$^2$D loop. The hybrid works as follows.
@@ -81,7 +87,9 @@ whole S$^2$D loop. The hybrid works as follows.
   \item On a cache hit, S$^2$D returns the normal cached AR-draft branch.
   \item On a cache miss, DFlash receives the verifier activation backlog,
         builds $[\text{recovery}, \textsc{mask}^{15}]$, and produces a
-        15-token draft block using the target embedding and LM head.
+        15-token draft block using the target embedding and LM head. In the
+        split-lookahead variant, the async response slices this block to the
+        first $k_{\mathrm{SSD}}$ positions before target verification.
   \item After the exact verifier accepts or rejects the proposed block, the
         scheduler appends only the verified target activations to the DFlash
         backlog and crops the DFlash cache back to the verified prefix.
@@ -105,6 +113,10 @@ currently focuses on greedy decoding to isolate systems behavior.
 
 The current DFlash+S$^2$D prototype intentionally supports only batch size
 $1$, two GPUs, Qwen3-style target activations, and greedy decoding. The
-verifier and drafter are placed on separate visible GPUs. This is sufficient
-to test the central systems question: can a one-pass target-conditioned
-diffusion block drafter make S$^2$D cache misses cheaper than AR fallback?
+verifier and drafter are placed on separate visible GPUs. The synchronous
+DFlash diagnostic path is single-GPU and keeps the DFlash-native $k=15$
+lookahead. The async hybrid additionally maintains DFlash KV state and target
+activation backlogs per sequence id, so multiple independent benchmark
+requests do not share stale DFlash cache state. This is sufficient to test the
+central systems question: can a one-pass target-conditioned diffusion block
+drafter make S$^2$D cache misses cheaper than AR fallback?

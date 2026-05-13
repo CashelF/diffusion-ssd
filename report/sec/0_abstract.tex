@@ -16,12 +16,16 @@ Second, we prototype a DFlash-style hybrid that uses target activations from
 the verifier to produce a first draft block on S$^2$D cache misses, while the
 normal autoregressive S$^2$D drafter serves cache hits and fills the future
 speculation cache. This is architecturally more promising because DFlash
-drafts a block in a single conditioned pass, but our current small-model
+drafts a block in a single conditioned pass, but our initial small-model
 prototype remains limited by systems overhead: on Qwen3-8B with a Qwen3-0.6B
 S$^2$D drafter and \texttt{Qwen3-8B-DFlash-b16}, we measured $11.68$
 tokens/s, average accepted length $3.30$, cache hit rate $0.60$, DFlash seed
-latency $34.48$ ms, and SSD tree-decode latency about $79$ ms. We conclude
-that diffusion drafters are only useful for S$^2$D when draft latency is far
-below target verification latency, and that representative evaluation requires
-a larger verifier and less resource-constrained hardware.
+latency $34.48$ ms, and SSD tree-decode latency about $79$ ms. Moving the
+prototype to a two-H100 Modal deployment and shortening only the S$^2$D
+lookahead from $15$ to $7$ improved a matched diagnostic run from $31.15$ to
+$32.82$ tokens/s by reducing draft-side tree work, while still using the
+native 15-token DFlash seed. We conclude that diffusion drafters are only
+useful for S$^2$D when draft latency is far below target verification latency,
+and that representative evaluation requires a larger verifier and less
+resource-constrained hardware.
 \end{abstract}

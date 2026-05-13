@@ -20,7 +20,12 @@ reported prototype numbers should therefore be read as diagnostic
 measurements, not as final throughput claims. This limitation matters:
 S$^2$D is a latency-hiding method, so evaluating it on a small verifier or on
 busy GPUs can make communication and scheduler overhead look much worse than
-it would with a larger target.
+it would with a larger target. For follow-up diagnostics, we moved the
+Qwen3-8B DFlash+S$^2$D experiments to a Modal deployment with persistent model
+and compiler caches. That app provides one-H100 entrypoints for AR and
+synchronous DFlash checks, two-H100 entrypoints for the async DFlash+S$^2$D
+path, and five-H100 entrypoints reserved for the original 70B SSD
+configuration.
 
 \paragraph{Models.}
 For the traditional block-diffusion path, we used the small Qwen-family stack
@@ -28,15 +33,19 @@ available in the repository and the block/MDLM-style draft checkpoints
 supported by our backend. For the DFlash hybrid, we used Qwen3-8B as the
 target, Qwen3-0.6B as the normal S$^2$D AR drafter, and
 \texttt{z-lab/Qwen3-8B-DFlash-b16} as the target-conditioned DFlash drafter.
-The DFlash checkpoint has block size $16$, so all DFlash runs use $k=15$.
+The DFlash checkpoint has block size $16$, so the DFlash seed always produces
+15 speculative tokens. In the split-lookahead hybrid, the SSD side can consume
+only a prefix of this seed, allowing us to compare $k_{\mathrm{SSD}}=15$ with
+$k_{\mathrm{SSD}}=7$ while keeping the DFlash checkpoint unchanged.
 
 \paragraph{Metrics.}
-We report end-to-end generated-token throughput, average accepted length per
-verify step, S$^2$D cache hit rate, DFlash seed latency, and SSD tree-decode
-latency. Throughput is the user-visible metric. Acceptance and cache hit rate
-diagnose draft quality and S$^2$D prediction quality. Seed and tree-decode
-latencies identify whether the bottleneck is DFlash, the AR tree cache, or
-cross-process orchestration.
+We report end-to-end generated-token throughput, decode throughput, average
+accepted length per verify step, S$^2$D cache hit rate, DFlash seed latency,
+draft-step latency, and SSD tree-decode latency. Throughput is the
+user-visible metric. Acceptance and cache hit rate diagnose draft quality and
+S$^2$D prediction quality. Seed, draft-step, and tree-decode latencies
+identify whether the bottleneck is DFlash, the AR tree cache, or cross-process
+orchestration.
 
 \subsection{Reference numbers from SSD and DFlash}
 
@@ -132,6 +141,39 @@ milliseconds, while the SSD tree-decode path is even larger. With an 8B
 verifier on busy A6000s, target verification is not slow enough for the
 separate-GPU draft path, tensor transfers, cache bookkeeping, and tree
 construction to be hidden.
+
+The H100 Modal runs let us test one direct systems optimization: keep the
+DFlash seed length at $15$, but reduce only the SSD tree depth to $7$.
+Table~\ref{tab:split-k} compares matched two-H100 runs with seeded random
+inputs, four requests, $128$ input tokens, and $64$ output tokens. The shorter
+SSD lookahead slightly reduces average tokens accepted per step, but it cuts
+draft-side tree work enough to improve total throughput.
+
+\begin{table}[t]
+  \caption{Two-H100 Modal DFlash+S$^2$D split-lookahead diagnostic. DFlash
+  always emits its native 15-token block; $k_{\mathrm{SSD}}$ controls how many
+  seed positions the SSD verifier/tree consumes.}
+  \label{tab:split-k}
+  \centering
+  \scriptsize
+  \begin{tabular}{@{}lrrrrrr@{}}
+    \toprule
+    $k_{\mathrm{SSD}}$ & Total & Decode & Tok./step & Acc. frac. & Hit & Draft ms \\
+    \midrule
+    15 & 31.15 & 40 & 3.71 & 0.18 & 0.68 & 57.02 \\
+     7 & 32.82 & 44 & 3.38 & 0.34 & 0.71 & 29.04 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The gain is modest but informative. Reducing $k_{\mathrm{SSD}}$ from $15$ to
+$7$ improved end-to-end throughput by about $5.4\%$, decode throughput by
+about $10\%$, and nearly halved measured draft-step time. This suggests that
+tree-cache construction and async draft bookkeeping are important fixed costs
+in the hybrid. It also explains why simply increasing the speculative block
+length is not always beneficial: beyond the point where additional drafted
+positions are rarely accepted, the larger SSD tree can cost more than it
+saves.
 
 \paragraph{Small verifiers are the wrong stress test.}
 S$^2$D benefits when the target verifier is much slower than the draft path.

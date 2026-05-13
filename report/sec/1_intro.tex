@@ -46,7 +46,10 @@ extracted from the target verifier. This target-conditioned design produces a
 whole speculative block in a single draft pass and has published speedups on
 Qwen3-8B and Qwen3-Coder-30B-A3B using SGLang~\cite{zheng2024sglang}. We
 therefore extended our study beyond conventional block diffusion and
-implemented a DFlash-seeded S$^2$D hybrid.
+implemented a DFlash-seeded S$^2$D hybrid. We also decouple the DFlash block
+length from the S$^2$D tree depth: the DFlash checkpoint still produces its
+native 15-token block, but the SSD verifier and tree cache may consume a
+shorter prefix of that block to reduce draft-side work.
 
 \paragraph{Contributions.}
 First, we integrated MDLM-style and BD3LM-style drafters into an S$^2$D

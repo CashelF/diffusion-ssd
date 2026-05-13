@@ -14,9 +14,16 @@ from the verifier and drafts a full block in one conditioned pass. We
 implemented a DFlash-seeded S$^2$D hybrid in which DFlash serves
 speculation-cache misses and the normal AR S$^2$D drafter serves cache hits
 and prepares the future tree cache. This preserves exact verification and
-keeps the fast S$^2$D hit path intact. Our current Qwen3-8B prototype is not
-yet fast, reaching $11.68$ tokens/s with $34.48$ ms DFlash seed latency and
-$79$ ms SSD tree-decode latency, but it isolates the right next bottlenecks.
+keeps the fast S$^2$D hit path intact. Our initial local Qwen3-8B prototype
+was not fast, reaching $11.68$ tokens/s with $34.48$ ms DFlash seed latency
+and $79$ ms SSD tree-decode latency, but it isolated the right next
+bottlenecks.
+Moving the same prototype to a Modal H100 environment and decoupling the
+DFlash seed length from the SSD lookahead improved a matched two-H100
+diagnostic from $31.15$ to $32.82$ tokens/s, mostly by reducing draft-side
+tree work. This is not a final serving result, but it makes the bottleneck
+more specific: the hybrid is dominated by tree-cache construction and
+orchestration unless the verifier is large enough to hide those costs.
 
 The broader conclusion is that S$^2$D is sensitive to the verifier/drafter
 latency ratio. On small target models, cross-GPU communication and
